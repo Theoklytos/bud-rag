@@ -96,11 +96,29 @@ def configure():
     )
     config.setdefault("embeddings", {})["base_url"] = emb_base_url
 
-    current_emb_model = config.get("embeddings", {}).get("model", "mxbai-embed-large:335m")
+    current_emb_model = config.get("embeddings", {}).get("model", "nomic-embed-text")
     emb_model = Prompt.ask(
         "[blue]Embeddings Model[/blue]", default=current_emb_model
     )
     config.setdefault("embeddings", {})["model"] = emb_model
+
+    # Show resolved model specs so the user knows what limits will be applied
+    from bud.lib.model_registry import resolve_embedding_model
+    model_cfg = resolve_embedding_model(emb_model)
+    if model_cfg["known"]:
+        console.print(
+            f"  [green]✓[/green] {model_cfg['description']}\n"
+            f"  [dim]chunk_max_tokens: {model_cfg['chunk_max_tokens']}  ·  "
+            f"max_embed_chars: {model_cfg['max_embed_chars']}[/dim]"
+        )
+    else:
+        console.print(
+            f"  [yellow]⚠  '{emb_model}' is not in the model registry — "
+            f"conservative 512-token defaults will be used.[/yellow]\n"
+            f"  [dim]chunk_max_tokens: {model_cfg['chunk_max_tokens']}  ·  "
+            f"max_embed_chars: {model_cfg['max_embed_chars']}[/dim]\n"
+            f"  [dim]Tip: run 'bud models' to see all supported models.[/dim]"
+        )
 
     # Save and validate
     console.print("\n[bold]Saving configuration...[/bold]")
@@ -118,6 +136,34 @@ def configure():
         for error in errors:
             console.print(f"  - {error}")
         console.print("\n[dim]Configuration still saved. Review and fix errors.[/dim]")
+
+
+@main.command("models")
+def models_command():
+    """List all supported embedding models and their configuration parameters."""
+    from bud.lib.model_registry import list_known_models
+
+    table = Table(title="Supported Embedding Models", show_lines=True)
+    table.add_column("Model", style="cyan", no_wrap=True)
+    table.add_column("Dims", style="magenta", justify="right")
+    table.add_column("Context (tokens)", style="yellow", justify="right")
+    table.add_column("max_embed_chars", style="green", justify="right")
+    table.add_column("chunk_max_tokens", style="blue", justify="right")
+
+    for entry in list_known_models():
+        table.add_row(
+            entry["model"],
+            str(entry["dimension"]),
+            str(entry["context_tokens"]),
+            str(entry["max_embed_chars"]),
+            str(entry["chunk_max_tokens"]),
+        )
+
+    console.print(table)
+    console.print(
+        "\n[dim]These limits are applied automatically when you run "
+        "'bud configure' or 'bud process'.[/dim]"
+    )
 
 
 @main.command()
@@ -211,9 +257,13 @@ def discover(output_dir, samples, iterations, stability, resume, blend, blend_sl
 
     output_dir.mkdir(parents=True, exist_ok=True)
     config = load_config()
+
+    # Derive chunk limits from the configured embedding model
+    from bud.lib.model_registry import resolve_embedding_model as _resolve
+    _model_cfg = _resolve(config.get("embeddings", {}).get("model", ""))
     config.setdefault("pipeline", {
-        "chunk_min_tokens": 10,
-        "chunk_max_tokens": 800,
+        "chunk_min_tokens": _model_cfg["chunk_min_tokens"],
+        "chunk_max_tokens": _model_cfg["chunk_max_tokens"],
         "schema_evolution_confidence_threshold": 5,
     })
 
@@ -419,10 +469,12 @@ def process(data_dir, output_dir, resume, batch_size, prompt, with_discovery):
     # Load config for LLM/embedding settings
     config = load_config()
 
-    # Add pipeline-specific config
+    # Derive chunk/embed limits from the configured embedding model
+    from bud.lib.model_registry import resolve_embedding_model as _resolve
+    _model_cfg = _resolve(config.get("embeddings", {}).get("model", ""))
     config.setdefault("pipeline", {
-        "chunk_min_tokens": 10,
-        "chunk_max_tokens": 800,
+        "chunk_min_tokens": _model_cfg["chunk_min_tokens"],
+        "chunk_max_tokens": _model_cfg["chunk_max_tokens"],
         "schema_evolution_confidence_threshold": 5,
     })
 
@@ -462,7 +514,7 @@ def process(data_dir, output_dir, resume, batch_size, prompt, with_discovery):
     # Initialize vector store
     index_path = str(index_mgr.index_dir / "chunks")
     from bud.lib.store import VectorStore
-    store = VectorStore(index_path, dim=768)
+    store = VectorStore(index_path, dim=_model_cfg["dimension"])
     if resume and os.path.exists(f"{index_path}.faiss"):
         store.load()
         console.print(f"[green]✓ Loaded existing index ({store.count()} chunks)[/green]")
@@ -639,6 +691,7 @@ def process(data_dir, output_dir, resume, batch_size, prompt, with_discovery):
                 index_mgr.embed_queue_path,
                 on_chunk=_on_chunk,
                 on_error=_on_error,
+                max_chars=_model_cfg["max_embed_chars"],
             )
 
             if failed < len(all_chunks_for_embed):

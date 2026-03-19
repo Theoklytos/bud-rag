@@ -6,7 +6,7 @@ import os
 from bud.lib.errors import EmbeddingError
 
 
-MAX_EMBED_CHARS = 8000  # nomic-embed-text supports 8192 tokens (~32k chars); 8000 chars ≈ 2000 tokens, comfortably covers any chunk
+MAX_EMBED_CHARS = 8000  # default; overridden per-model via model_registry
 
 
 def embed_chunks(
@@ -16,6 +16,7 @@ def embed_chunks(
     queue_path: str,
     on_chunk=None,
     on_error=None,
+    max_chars: int = MAX_EMBED_CHARS,
 ) -> int:
     """Embed chunks and add to vector store.
 
@@ -29,6 +30,8 @@ def embed_chunks(
         on_error: Optional callback(chunk: dict, error_msg: str) called for
             each chunk that fails to embed.  Useful for surfacing failures
             in the CLI without breaking the batch loop.
+        max_chars: Maximum characters of chunk text sent to the embedding API.
+            Derived from the model's context window via model_registry.
 
     Returns:
         Number of chunks that failed to embed
@@ -42,8 +45,8 @@ def embed_chunks(
                 on_chunk(idx, total)
             continue
         try:
-            # Truncate text to avoid context length errors
-            text = chunk["text"][:MAX_EMBED_CHARS]
+            # Truncate text to the model's effective context window
+            text = chunk["text"][:max_chars]
             vector = embedding_client.embed(text)
             metadata = {k: v for k, v in chunk.items()}
             metadata["chunk_id"] = chunk_id
