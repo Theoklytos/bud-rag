@@ -19,7 +19,7 @@ DEFAULT_CONFIG = {
     "embeddings": {
         "provider": "ollama",
         "base_url": "http://localhost:11434",
-        "model": "mxbai-embed-large:335m",
+        "model": "nomic-embed-text",
     },
 }
 

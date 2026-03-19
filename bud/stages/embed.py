@@ -6,7 +6,7 @@ import os
 from bud.lib.errors import EmbeddingError
 
 
-MAX_EMBED_CHARS = 2000  # Conservative limit for mxbai-embed-large
+MAX_EMBED_CHARS = 8000  # default; overridden per-model via model_registry
 
 
 def embed_chunks(
@@ -15,6 +15,8 @@ def embed_chunks(
     store,
     queue_path: str,
     on_chunk=None,
+    on_error=None,
+    max_chars: int = MAX_EMBED_CHARS,
 ) -> int:
     """Embed chunks and add to vector store.
 
@@ -25,6 +27,11 @@ def embed_chunks(
         queue_path: Path to embedding failure queue file
         on_chunk: Optional callback(done: int, total: int) called after each
             chunk attempt (success or failure) for live progress reporting.
+        on_error: Optional callback(chunk: dict, error_msg: str) called for
+            each chunk that fails to embed.  Useful for surfacing failures
+            in the CLI without breaking the batch loop.
+        max_chars: Maximum characters of chunk text sent to the embedding API.
+            Derived from the model's context window via model_registry.
 
     Returns:
         Number of chunks that failed to embed
@@ -38,10 +45,10 @@ def embed_chunks(
                 on_chunk(idx, total)
             continue
         try:
-            # Truncate text to avoid context length errors
-            text = chunk["text"][:MAX_EMBED_CHARS]
+            # Truncate text to the model's effective context window
+            text = chunk["text"][:max_chars]
             vector = embedding_client.embed(text)
-            metadata = {k: v for k, v in chunk.items() if k != "text"}
+            metadata = {k: v for k, v in chunk.items()}
             metadata["chunk_id"] = chunk_id
 
             # Ensure store has correct dimension before adding
@@ -55,8 +62,10 @@ def embed_chunks(
                 store._create_index()
 
             store.add([vector], [metadata])
-        except EmbeddingError:
+        except EmbeddingError as e:
             failures.append(chunk)
+            if on_error:
+                on_error(chunk, str(e))
         if on_chunk:
             on_chunk(idx, total)
 

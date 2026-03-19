@@ -19,7 +19,7 @@ VALID_CONFIG = {
     "embeddings": {
         "provider": "ollama",
         "base_url": "http://localhost:11434",
-        "model": "mxbai-embed-large",
+        "model": "nomic-embed-text",
     },
 }
 
