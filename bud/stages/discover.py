@@ -289,6 +289,7 @@ def run_discovery(
     stability_threshold: float = 0.75,
     max_iterations: int = 10,
     on_iteration: Optional[Callable] = None,
+    on_sampling: Optional[Callable] = None,
     use_blend: bool = False,
     blend_slices: int = 6,
     blend_width: int = 8,
@@ -307,7 +308,10 @@ def run_discovery(
         n_samples: Conversations to sample per iteration (ignored when blending).
         stability_threshold: Stop early when stability_score >= this value.
         max_iterations: Hard cap on iterations.
-        on_iteration: Optional callback(iteration_num, stability_score, concept_map).
+        on_iteration: Optional callback(iteration_num, stability_score, concept_map)
+            called after the LLM responds and the map is updated.
+        on_sampling: Optional callback(iteration_num, max_iterations) called
+            immediately before the LLM call so UIs can show a "waiting" state.
         use_blend: When True, use ``blend_archive`` instead of
             ``_sample_conversations``.  Blending crosses conversation boundaries,
             exposing structural patterns invisible to whole-conversation sampling.
@@ -327,6 +331,10 @@ def run_discovery(
             if not samples:
                 break
             sample_text = _format_samples(samples)
+
+        if on_sampling:
+            on_sampling(i + 1, max_iterations)
+
         current_map_json = json.dumps(concept_map.data, indent=2)
 
         user_prompt = DISCOVERY_USER_TEMPLATE.format(
