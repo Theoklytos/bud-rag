@@ -20,6 +20,7 @@ class IndexManager:
         self._schema_path = str(output_dir / "schema.json")
         self._progress_path = str(output_dir / "progress.json")
         self._embed_queue_path = str(output_dir / "embed_queue.jsonl")
+        self._discovery_map_path = str(output_dir / "discovery_map.json")
 
     @property
     def index_dir(self) -> Path:
@@ -40,6 +41,11 @@ class IndexManager:
     def embed_queue_path(self) -> str:
         """Return the embed queue file path."""
         return self._embed_queue_path
+
+    @property
+    def discovery_map_path(self) -> str:
+        """Return the discovery map file path."""
+        return self._discovery_map_path
 
     def ensure_directories(self) -> None:
         """Create required output directories."""
