@@ -52,6 +52,19 @@ def test_embed_chunks_calls_embed_for_each_chunk(tmp_path):
     assert store.add.call_count == 2
 
 
+def test_embed_chunks_stores_text_in_metadata(tmp_path):
+    """Text must be included in stored metadata so queries can retrieve it."""
+    chunks = [_make_chunk("a", text="hello world")]
+    client = _make_embedding_client()
+    store = _make_store()
+    queue = str(tmp_path / "queue.jsonl")
+
+    embed_chunks(chunks, client, store, queue)
+
+    stored_metadata = store.add.call_args[0][1][0]
+    assert stored_metadata.get("text") == "hello world"
+
+
 def test_embed_chunks_skips_existing_chunk_ids(tmp_path):
     chunks = [_make_chunk("existing"), _make_chunk("new")]
     client = _make_embedding_client()

@@ -785,18 +785,10 @@ def query(query_text, k, output_dir):
         console.print("[yellow]No matching chunks found.[/yellow]")
         return
 
-    # Get metadata for results
-    results_with_metadata = []
-    for result in search_results:
-        chunk_id = result.get("chunk_id")
-        metadata = store.get_by_id(chunk_id)
-        if metadata:
-            results_with_metadata.append(metadata)
-
     # Build context from retrieved chunks
     context_parts = []
-    for i, chunk in enumerate(results_with_metadata, 1):
-        context_parts.append(f"[{i}] {chunk.get('text', 'No text')}")
+    for i, chunk in enumerate(search_results, 1):
+        context_parts.append(f"[{i}] {chunk.get('text', '')}")
 
     context = "\n\n".join(context_parts)
 
@@ -832,9 +824,8 @@ Instructions:
     table.add_column("Score", style="magenta", no_wrap=True)
     table.add_column("Source", style="green")
 
-    for i, chunk in enumerate(results_with_metadata, 1):
+    for i, chunk in enumerate(search_results, 1):
         rank = str(i)
-        # Get score from search results if available
         score = chunk.get("score", "N/A")
         source = chunk.get("source_file", chunk.get("source", "conversations.jsonl"))
         table.add_row(rank, str(score), source)

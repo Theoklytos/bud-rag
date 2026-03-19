@@ -6,7 +6,7 @@ import os
 from bud.lib.errors import EmbeddingError
 
 
-MAX_EMBED_CHARS = 2000  # Conservative limit for mxbai-embed-large
+MAX_EMBED_CHARS = 8000  # nomic-embed-text supports 8192 tokens (~32k chars); 8000 chars ≈ 2000 tokens, comfortably covers any chunk
 
 
 def embed_chunks(
@@ -45,7 +45,7 @@ def embed_chunks(
             # Truncate text to avoid context length errors
             text = chunk["text"][:MAX_EMBED_CHARS]
             vector = embedding_client.embed(text)
-            metadata = {k: v for k, v in chunk.items() if k != "text"}
+            metadata = {k: v for k, v in chunk.items()}
             metadata["chunk_id"] = chunk_id
 
             # Ensure store has correct dimension before adding
