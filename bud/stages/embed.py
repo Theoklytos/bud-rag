@@ -14,6 +14,7 @@ def embed_chunks(
     embedding_client,
     store,
     queue_path: str,
+    on_chunk=None,
 ) -> int:
     """Embed chunks and add to vector store.
 
@@ -22,14 +23,19 @@ def embed_chunks(
         embedding_client: EmbeddingClient instance
         store: VectorStore instance
         queue_path: Path to embedding failure queue file
+        on_chunk: Optional callback(done: int, total: int) called after each
+            chunk attempt (success or failure) for live progress reporting.
 
     Returns:
         Number of chunks that failed to embed
     """
     failures = []
-    for chunk in chunks:
+    total = len(chunks)
+    for idx, chunk in enumerate(chunks, 1):
         chunk_id = chunk["chunk_id"]
         if store.chunk_id_exists(chunk_id):
+            if on_chunk:
+                on_chunk(idx, total)
             continue
         try:
             # Truncate text to avoid context length errors
@@ -51,6 +57,8 @@ def embed_chunks(
             store.add([vector], [metadata])
         except EmbeddingError:
             failures.append(chunk)
+        if on_chunk:
+            on_chunk(idx, total)
 
     if failures:
         write_embed_queue(queue_path, failures, append=True)

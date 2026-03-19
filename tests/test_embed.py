@@ -120,3 +120,50 @@ def test_clear_embed_queue_removes_file(tmp_path):
 
 def test_clear_embed_queue_noop_when_no_file(tmp_path):
     clear_embed_queue(str(tmp_path / "nofile.jsonl"))  # should not raise
+
+
+# ---------------------------------------------------------------------------
+# on_chunk callback tests
+# ---------------------------------------------------------------------------
+
+
+def test_on_chunk_called_for_each_chunk(tmp_path):
+    client = _make_embedding_client()
+    store = _make_store()
+    chunks = [_make_chunk(f"c{i}") for i in range(3)]
+    calls = []
+    embed_chunks(chunks, client, store, str(tmp_path / "q.jsonl"), on_chunk=lambda d, t: calls.append((d, t)))
+    assert len(calls) == 3
+    assert calls[0] == (1, 3)
+    assert calls[2] == (3, 3)
+
+
+def test_on_chunk_called_for_skipped_chunks(tmp_path):
+    """on_chunk fires even when a chunk already exists in the store."""
+    client = _make_embedding_client()
+    store = _make_store(existing_ids=["dup"])
+    chunks = [_make_chunk("dup")]
+    calls = []
+    embed_chunks(chunks, client, store, str(tmp_path / "q.jsonl"), on_chunk=lambda d, t: calls.append((d, t)))
+    assert len(calls) == 1
+    assert calls[0] == (1, 1)
+
+
+def test_on_chunk_called_on_failure(tmp_path):
+    """on_chunk fires even when embedding raises EmbeddingError."""
+    client = _make_embedding_client()
+    client.embed.side_effect = EmbeddingError("boom")
+    store = _make_store()
+    chunks = [_make_chunk("fail")]
+    calls = []
+    embed_chunks(chunks, client, store, str(tmp_path / "q.jsonl"), on_chunk=lambda d, t: calls.append((d, t)))
+    assert len(calls) == 1
+
+
+def test_on_chunk_none_does_not_raise(tmp_path):
+    client = _make_embedding_client()
+    store = _make_store()
+    chunks = [_make_chunk("ok")]
+    # no on_chunk — should complete without error
+    result = embed_chunks(chunks, client, store, str(tmp_path / "q.jsonl"))
+    assert result == 0

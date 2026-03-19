@@ -21,6 +21,7 @@ class IndexManager:
         self._progress_path = str(output_dir / "progress.json")
         self._embed_queue_path = str(output_dir / "embed_queue.jsonl")
         self._discovery_map_path = str(output_dir / "discovery_map.json")
+        self._blend_cursor_path = str(output_dir / "blend_cursor.json")
 
     @property
     def index_dir(self) -> Path:
@@ -46,6 +47,11 @@ class IndexManager:
     def discovery_map_path(self) -> str:
         """Return the discovery map file path."""
         return self._discovery_map_path
+
+    @property
+    def blend_cursor_path(self) -> str:
+        """Return the blend cursor file path."""
+        return self._blend_cursor_path
 
     def ensure_directories(self) -> None:
         """Create required output directories."""

@@ -170,15 +170,37 @@ def configure():
     default=8,
     help="Turns per blend slice (default: 8)",
 )
-def discover(output_dir, samples, iterations, stability, resume, blend, blend_slices, blend_width):
+@click.option(
+    "--progressive/--no-progressive",
+    default=False,
+    help=(
+        "Progressive cursor-based blending: takes one slice per file per iteration, "
+        "advancing a saved cursor so the entire archive is covered exhaustively. "
+        "Cursor persists across runs; use --reset-cursor to start over."
+    ),
+)
+@click.option(
+    "--reset-cursor",
+    is_flag=True,
+    default=False,
+    help="Reset the progressive blend cursor to the beginning of all files.",
+)
+def discover(output_dir, samples, iterations, stability, resume, blend, blend_slices, blend_width, progressive, reset_cursor):
     """Run the iterative pattern discovery phase.
 
-    Samples conversations randomly and asks the LLM to notice structural,
-    geometric, and topological patterns. Accumulates a concept map that
-    can be injected into the chunking stage via 'bud process --with-discovery'.
+    Samples conversations and asks the LLM to notice structural, geometric,
+    and topological patterns. Accumulates a concept map that can be injected
+    into the chunking stage via 'bud process --with-discovery'.
+
+    Sampling modes (pick one):
+      default      -- random whole-conversation sampling
+      --blend      -- random cross-boundary slices (no memory)
+      --progressive -- cursor-based: one slice per file, exhaustive coverage
     """
     from rich.console import Console
-    from rich.progress import Progress, SpinnerColumn, TextColumn
+    from rich.progress import (
+        Progress, SpinnerColumn, TextColumn, TimeElapsedColumn,
+    )
 
     console = Console()
 
@@ -197,7 +219,9 @@ def discover(output_dir, samples, iterations, stability, resume, blend, blend_sl
 
     console.print("\n[bold cyan]Bud RAG Pipeline — Discovery Phase[/bold cyan]\n")
     console.print(f"[dim]Output directory: {output_dir}[/dim]")
-    if blend:
+    if progressive:
+        console.print(f"[dim]Mode: progressive ({blend_width} turns/file/iteration)[/dim]")
+    elif blend:
         console.print(f"[dim]Mode: blend ({blend_slices} slices × {blend_width} turns)[/dim]")
     else:
         console.print(f"[dim]Samples per iteration: {samples}[/dim]")
@@ -231,21 +255,60 @@ def discover(output_dir, samples, iterations, stability, resume, blend, blend_sl
             f"stability={concept_map.stability_score:.2f})[/green]\n"
         )
 
+    # Set up progressive cursor if requested
+    cursor = None
+    file_totals: dict = {}
+    if progressive:
+        from bud.stages.blend import BlendCursor
+        cursor = BlendCursor(index_mgr.blend_cursor_path)
+        if reset_cursor:
+            cursor.reset()
+            console.print("[yellow]⚠  Blend cursor reset — starting from the beginning[/yellow]\n")
+        else:
+            cursor.load()
+            if not cursor.is_empty():
+                console.print(
+                    f"[green]✓ Resuming blend cursor "
+                    f"({len(cursor.data)} file(s) tracked)[/green]\n"
+                )
+
     with Progress(
         SpinnerColumn(),
         TextColumn("[progress.description]{task.description}"),
+        TimeElapsedColumn(),
         console=console,
+        refresh_per_second=8,
     ) as progress:
-        task = progress.add_task("Discovering patterns...", total=None)
+        task = progress.add_task("Sampling...", total=None)
 
-        def on_iteration(iteration_num, score, cmap):
+        def on_sampling(iteration_num, max_iter):
+            if progressive:
+                mode_tag = "progressive"
+            elif blend:
+                mode_tag = "blend"
+            else:
+                mode_tag = "sample"
             progress.update(
                 task,
                 description=(
-                    f"Iteration {iteration_num}/{iterations}  "
+                    f"[dim]iter {iteration_num}/{max_iter}  "
+                    f"{mode_tag}  "
+                    f"waiting for LLM...[/dim]"
+                ),
+            )
+
+        def on_iteration(iteration_num, score, cmap):
+            signals   = len(cmap.data.get("boundary_signals", []))
+            archetypes = len(cmap.data.get("chunk_archetypes", []))
+            anchors   = len(cmap.data.get("coherence_anchors", []))
+            stable_bar = "▓" * int(score * 10) + "░" * (10 - int(score * 10))
+            progress.update(
+                task,
+                description=(
+                    f"iter {iteration_num}/{iterations}  "
+                    f"[{'green' if score >= stability else 'yellow'}]{stable_bar}[/{'green' if score >= stability else 'yellow'}] "
                     f"stability={score:.2f}  "
-                    f"signals={len(cmap.data.get('boundary_signals', []))}  "
-                    f"archetypes={len(cmap.data.get('chunk_archetypes', []))}"
+                    f"[dim]signals={signals}  archetypes={archetypes}  anchors={anchors}[/dim]"
                 ),
             )
 
@@ -257,9 +320,12 @@ def discover(output_dir, samples, iterations, stability, resume, blend, blend_sl
             stability_threshold=stability,
             max_iterations=iterations,
             on_iteration=on_iteration,
+            on_sampling=on_sampling,
             use_blend=blend,
             blend_slices=blend_slices,
             blend_width=blend_width,
+            use_progressive=progressive,
+            cursor=cursor,
         )
 
     console.print(f"\n[green]✓ Discovery complete![/green]")
@@ -270,6 +336,21 @@ def discover(output_dir, samples, iterations, stability, resume, blend, blend_sl
     console.print(f"  Chunk archetypes: {len(concept_map.data.get('chunk_archetypes', []))}")
     console.print(f"  Anti-patterns: {len(concept_map.data.get('anti_patterns', []))}")
     console.print(f"\n[dim]Concept map saved to: {index_mgr.discovery_map_path}[/dim]")
+
+    if progressive and cursor is not None:
+        from bud.stages.blend import blend_progressive as _bp, _load_turns
+        file_totals = {
+            f.name: len(_load_turns(f))
+            for f in sorted((output_dir / "parsed").glob("*.jsonl"))
+        }
+        coverage = cursor.coverage(file_totals)
+        if coverage:
+            console.print("\n  [dim]Blend cursor coverage:[/dim]")
+            for fname, pct in sorted(coverage.items()):
+                bar = "▓" * int(pct * 20) + "░" * (20 - int(pct * 20))
+                console.print(f"    {bar} {pct*100:.0f}%  {fname}")
+        console.print(f"  [dim]Cursor saved to: {index_mgr.blend_cursor_path}[/dim]")
+
     console.print("[dim]Run 'bud process --with-discovery' to use it for chunking.[/dim]\n")
 
 
@@ -312,7 +393,10 @@ def process(data_dir, output_dir, resume, batch_size, prompt, with_discovery):
     Processes conversation data and builds the vector index.
     """
     from rich.console import Console
-    from rich.progress import Progress, SpinnerColumn, TextColumn
+    from rich.progress import (
+        Progress, SpinnerColumn, TextColumn,
+        BarColumn, MofNCompleteColumn, TimeElapsedColumn,
+    )
 
     console = Console()
 
@@ -448,42 +532,57 @@ def process(data_dir, output_dir, resume, batch_size, prompt, with_discovery):
 
     # Process in batches
     from bud.stages.chunk import chunk_conversation
-    from bud.stages.embed import embed_chunks
+    from bud.stages.embed import embed_chunks, clear_embed_queue
 
     total_chunks = 0
     errors = 0
-    schema_proposals = []
 
-    console.print("[cyan]→ Chunking and embedding[/cyan]")
+    n_convs = len(all_conversations)
+    n_batches = max(1, (n_convs + batch_size - 1) // batch_size)
+
+    console.print(f"[cyan]→ Chunking and embedding {n_convs} conversations[/cyan]")
 
     with Progress(
         SpinnerColumn(),
         TextColumn("[progress.description]{task.description}"),
+        BarColumn(bar_width=28),
+        MofNCompleteColumn(),
+        TimeElapsedColumn(),
         console=console,
+        refresh_per_second=8,
     ) as progress:
-        parse_task = progress.add_task("Parsing...", total=None)
-        chunk_task = progress.add_task("Chunking...", total=None)
-        embed_task = progress.add_task("Embedding...", total=None)
+        conv_task  = progress.add_task("[cyan]Conversations[/cyan]", total=n_convs)
+        op_task    = progress.add_task("", total=None)
 
-        # Parse task
-        progress.update(parse_task, description=f"Parsed {total_conversations} conversations")
-
-        # Process conversations in batches
-        batch_num = 0
-        for i in range(0, len(all_conversations), batch_size):
+        conv_idx = 0
+        for i in range(0, n_convs, batch_size):
             batch = all_conversations[i:i + batch_size]
-            batch_num += 1
-            filename = f"conversations_{i // batch_size + 1}.jsonl"
+            batch_num = i // batch_size + 1
+            filename = f"conversations_{batch_num}.jsonl"
 
-            # Check if batch is complete for resume
+            # Skip already-processed batches when resuming
             if resume and tracker.is_complete(filename, batch_num):
-                progress.update(chunk_task, description=f"Skipping {filename} (already processed)")
+                progress.update(conv_task, advance=len(batch))
+                conv_idx += len(batch)
+                progress.update(
+                    op_task,
+                    description=f"[dim]skipped batch {batch_num}/{n_batches} (already done)[/dim]",
+                )
                 continue
 
-            # Chunk the batch
-            progress.update(chunk_task, description=f"Chunking {filename}...")
+            # --- Chunking ---
             batch_chunks = []
             for conv in batch:
+                conv_idx += 1
+                name = (conv.get("conversation_name") or conv["id"])[:52]
+                progress.update(
+                    op_task,
+                    description=(
+                        f"[yellow]chunk[/yellow]  "
+                        f"batch {batch_num}/{n_batches}  "
+                        f"[dim]{name}[/dim]"
+                    ),
+                )
                 try:
                     chunks = chunk_conversation(
                         conv, schema, llm, config, system_prompt, prompt_preset=prompt,
@@ -492,7 +591,6 @@ def process(data_dir, output_dir, resume, batch_size, prompt, with_discovery):
                     )
                     batch_chunks.extend(chunks)
 
-                    # Track schema proposals
                     for chunk in chunks:
                         for proposal in chunk.get("schema_proposals", []):
                             schema_mgr.propose_candidate(
@@ -500,32 +598,69 @@ def process(data_dir, output_dir, resume, batch_size, prompt, with_discovery):
                                 proposal["value"],
                                 proposal.get("rationale", "")
                             )
-
                 except Exception as e:
                     errors += 1
-                    console.print(f"  [red]✗ Chunking error in {conv['id']}: {e}[/red]")
+                    progress.print(f"  [red]✗ chunk error  {conv['id']}: {e}[/red]")
+
+                progress.update(conv_task, advance=1)
 
             total_chunks += len(batch_chunks)
 
-            # Embed the chunks (add failed chunks from queue first)
+            # --- Embedding ---
             all_chunks_for_embed = failed_chunks + batch_chunks
-            failed = embed_chunks(all_chunks_for_embed, embedding_client, store, index_mgr.embed_queue_path)
+            n_embed = len(all_chunks_for_embed)
 
-            # Clear queue after successful embed (keep failures)
+            def _on_chunk(done, total, _batch=batch_num):
+                progress.update(
+                    op_task,
+                    description=(
+                        f"[blue]embed[/blue]   "
+                        f"batch {_batch}/{n_batches}  "
+                        f"[dim]{done}/{total} chunks[/dim]"
+                    ),
+                )
+
+            progress.update(
+                op_task,
+                description=(
+                    f"[blue]embed[/blue]   "
+                    f"batch {batch_num}/{n_batches}  "
+                    f"[dim]0/{n_embed} chunks[/dim]"
+                ),
+            )
+            failed = embed_chunks(
+                all_chunks_for_embed, embedding_client, store,
+                index_mgr.embed_queue_path,
+                on_chunk=_on_chunk,
+            )
+
             if failed < len(all_chunks_for_embed):
-                from bud.stages.embed import clear_embed_queue
                 clear_embed_queue(index_mgr.embed_queue_path)
+            failed_chunks = []
 
-            failed_chunks = []  # Reset - failures are now in queue
+            embedded = n_embed - failed
+            progress.update(
+                op_task,
+                description=(
+                    f"[green]✓ batch {batch_num}/{n_batches}[/green]  "
+                    f"[dim]{len(batch_chunks)} chunks  "
+                    f"{embedded} embedded  "
+                    f"{total_chunks} total  "
+                    f"{errors} errors[/dim]"
+                ),
+            )
 
-            progress.update(chunk_task, description=f"Chunked {len(batch_chunks)} chunks from {filename}")
-            progress.update(embed_task, description=f"Embedded {len(batch_chunks) - failed} chunks")
-
-            # Mark batch as complete
             tracker.mark_complete(filename, batch_num)
 
-        progress.update(chunk_task, description=f"Total chunks: {total_chunks}")
-        progress.update(embed_task, description=f"Total embedded: {store.count() if store else 0}")
+        progress.update(
+            op_task,
+            description=(
+                f"[bold green]done[/bold green]  "
+                f"[dim]{total_chunks} chunks  "
+                f"{store.count() if store else 0} in index  "
+                f"{errors} errors[/dim]"
+            ),
+        )
 
     # Apply schema evolution
     promoted = schema_mgr.apply_promotions(config)
