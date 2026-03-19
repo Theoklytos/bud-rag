@@ -122,6 +122,132 @@ def configure():
 
 @main.command()
 @click.option(
+    "--output-dir", "-o",
+    type=click.Path(file_okay=False, resolve_path=True),
+    help="Path to output directory (overrides config)",
+)
+@click.option(
+    "--samples", "-s",
+    type=int,
+    default=5,
+    help="Conversations to sample per iteration (default: 5)",
+)
+@click.option(
+    "--iterations", "-n",
+    type=int,
+    default=10,
+    help="Maximum discovery iterations (default: 10)",
+)
+@click.option(
+    "--stability", "-t",
+    type=float,
+    default=0.75,
+    help="Stability threshold to stop early (default: 0.75)",
+)
+@click.option(
+    "--resume/--no-resume", "-r",
+    default=False,
+    help="Resume from existing concept map",
+)
+def discover(output_dir, samples, iterations, stability, resume):
+    """Run the iterative pattern discovery phase.
+
+    Samples conversations randomly and asks the LLM to notice structural,
+    geometric, and topological patterns. Accumulates a concept map that
+    can be injected into the chunking stage via 'bud process --with-discovery'.
+    """
+    from rich.console import Console
+    from rich.progress import Progress, SpinnerColumn, TextColumn
+
+    console = Console()
+
+    if output_dir:
+        output_dir = Path(output_dir)
+    else:
+        output_dir = get_output_dir()
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    config = load_config()
+    config.setdefault("pipeline", {
+        "chunk_min_tokens": 10,
+        "chunk_max_tokens": 800,
+        "schema_evolution_confidence_threshold": 5,
+    })
+
+    console.print("\n[bold cyan]Bud RAG Pipeline — Discovery Phase[/bold cyan]\n")
+    console.print(f"[dim]Output directory: {output_dir}[/dim]")
+    console.print(f"[dim]Samples per iteration: {samples}[/dim]")
+    console.print(f"[dim]Max iterations: {iterations}[/dim]")
+    console.print(f"[dim]Stability threshold: {stability}[/dim]\n")
+
+    from bud.stages.index import IndexManager
+    index_mgr = IndexManager(output_dir, config)
+    index_mgr.ensure_directories()
+
+    parsed_dir = output_dir / "parsed"
+    if not parsed_dir.exists() or not any(parsed_dir.glob("*.jsonl")):
+        console.print(
+            "[red]No parsed conversations found.[/red]\n"
+            "[dim]Run 'bud process' first (or at least the parse stage) to generate "
+            "parsed/*.jsonl files.[/dim]"
+        )
+        return
+
+    from bud.lib.llm import LLMClient
+    from bud.stages.discover import DiscoveryMap, run_discovery
+
+    llm = LLMClient(config)
+
+    concept_map = DiscoveryMap(index_mgr.discovery_map_path)
+    if resume:
+        concept_map.load()
+        console.print(
+            f"[green]✓ Resuming from existing map "
+            f"({concept_map.iterations_completed} iterations done, "
+            f"stability={concept_map.stability_score:.2f})[/green]\n"
+        )
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        console=console,
+    ) as progress:
+        task = progress.add_task("Discovering patterns...", total=None)
+
+        def on_iteration(iteration_num, score, cmap):
+            progress.update(
+                task,
+                description=(
+                    f"Iteration {iteration_num}/{iterations}  "
+                    f"stability={score:.2f}  "
+                    f"signals={len(cmap.data.get('boundary_signals', []))}  "
+                    f"archetypes={len(cmap.data.get('chunk_archetypes', []))}"
+                ),
+            )
+
+        concept_map = run_discovery(
+            parsed_dir=str(parsed_dir),
+            concept_map=concept_map,
+            llm=llm,
+            n_samples=samples,
+            stability_threshold=stability,
+            max_iterations=iterations,
+            on_iteration=on_iteration,
+        )
+
+    console.print(f"\n[green]✓ Discovery complete![/green]")
+    console.print(f"  Iterations: {concept_map.iterations_completed}")
+    console.print(f"  Stability score: {concept_map.stability_score:.2f}")
+    console.print(f"  Boundary signals: {len(concept_map.data.get('boundary_signals', []))}")
+    console.print(f"  Coherence anchors: {len(concept_map.data.get('coherence_anchors', []))}")
+    console.print(f"  Chunk archetypes: {len(concept_map.data.get('chunk_archetypes', []))}")
+    console.print(f"  Anti-patterns: {len(concept_map.data.get('anti_patterns', []))}")
+    console.print(f"\n[dim]Concept map saved to: {index_mgr.discovery_map_path}[/dim]")
+    console.print("[dim]Run 'bud process --with-discovery' to use it for chunking.[/dim]\n")
+
+
+@main.command()
+@click.option(
     "--data-dir", "-d",
     type=click.Path(exists=True, file_okay=False, resolve_path=True),
     help="Path to input data directory (overrides config)",
@@ -148,7 +274,12 @@ def configure():
     default="conversational",
     help="Prompt preset to use for chunking",
 )
-def process(data_dir, output_dir, resume, batch_size, prompt):
+@click.option(
+    "--with-discovery/--no-discovery",
+    default=False,
+    help="Inject discovery concept map into chunking prompts",
+)
+def process(data_dir, output_dir, resume, batch_size, prompt, with_discovery):
     """Run the full RAG pipeline.
 
     Processes conversation data and builds the vector index.
@@ -188,6 +319,8 @@ def process(data_dir, output_dir, resume, batch_size, prompt):
     console.print(f"[dim]Output directory: {output_dir}[/dim]")
     console.print(f"[dim]Prompt preset: {prompt}[/dim]")
     console.print(f"[dim]Batch size: {batch_size}[/dim]")
+    if with_discovery:
+        console.print(f"[dim]Discovery: enabled[/dim]")
     console.print("")
 
     # Initialize index manager
@@ -251,6 +384,24 @@ def process(data_dir, output_dir, resume, batch_size, prompt):
         "file_context": f"{len(conv_files)} conversation files",
     })
 
+    # Load discovery concept map if requested
+    concept_map_summary = None
+    if with_discovery:
+        from bud.stages.discover import DiscoveryMap
+        dm = DiscoveryMap(index_mgr.discovery_map_path).load()
+        if dm.is_empty():
+            console.print(
+                "[yellow]⚠ No discovery map found. Run 'bud discover' first, "
+                "or omit --with-discovery.[/yellow]\n"
+            )
+        else:
+            concept_map_summary = dm.to_summary()
+            console.print(
+                f"[green]✓ Loaded discovery map "
+                f"({dm.iterations_completed} iterations, "
+                f"stability={dm.stability_score:.2f})[/green]"
+            )
+
     # Parse conversations
     parsed_dir = output_dir / "parsed"
     from bud.stages.parse import parse_conversations_file, parse_all
@@ -309,7 +460,8 @@ def process(data_dir, output_dir, resume, batch_size, prompt):
                 try:
                     chunks = chunk_conversation(
                         conv, schema, llm, config, system_prompt, prompt_preset=prompt,
-                        schema_version=schema["version"]
+                        schema_version=schema["version"],
+                        concept_map_summary=concept_map_summary,
                     )
                     batch_chunks.extend(chunks)
 

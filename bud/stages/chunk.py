@@ -99,6 +99,7 @@ def chunk_conversation(
     prompt_preset: str = "conversational",
     schema_version: int = 1,
     max_retries: int = 2,
+    concept_map_summary: str | None = None,
 ) -> list[dict]:
     """Chunk a conversation using LLM.
 
@@ -111,10 +112,22 @@ def chunk_conversation(
         prompt_preset: Name of the prompt preset
         schema_version: Current schema version
         max_retries: Number of retry attempts
+        concept_map_summary: Optional JSON summary from discovery phase.
+            When provided, it is appended to the system prompt so the LLM
+            chunks with archive-aware, pattern-informed boundaries.
 
     Returns:
         List of chunk dicts
     """
+    system_prompt = prompt
+    if concept_map_summary:
+        system_prompt = (
+            prompt
+            + "\n\n## Archive Pattern Map\n"
+            + "Use these discovered patterns to guide your chunking decisions:\n"
+            + concept_map_summary
+        )
+
     dims = schema["dimensions"]
     user_msg = CHUNK_USER_TEMPLATE.format(
         name=conversation.get("conversation_name", "(unnamed)"),
@@ -133,7 +146,7 @@ def chunk_conversation(
     data = None
     for attempt in range(max_retries + 1):
         try:
-            response_text = llm.complete(system=prompt, user=user_msg)
+            response_text = llm.complete(system=system_prompt, user=user_msg)
             text = response_text.strip()
             if text.startswith("```"):
                 text = text.split("```")[1]
