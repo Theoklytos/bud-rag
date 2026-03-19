@@ -293,36 +293,57 @@ def run_discovery(
     use_blend: bool = False,
     blend_slices: int = 6,
     blend_width: int = 8,
+    use_progressive: bool = False,
+    cursor=None,
 ) -> DiscoveryMap:
     """Run the iterative pattern discovery loop.
 
-    Each iteration either samples whole conversations (default) or builds a
-    cross-boundary blended sample (``use_blend=True``), asks the LLM to notice
-    structural patterns, and accumulates a concept map until stability is reached
-    or ``max_iterations`` is hit.
+    Each iteration samples the archive in one of three modes, asks the LLM to
+    notice structural patterns, and accumulates a concept map until stability is
+    reached or ``max_iterations`` is hit.
+
+    Sampling modes (evaluated in priority order):
+
+    * ``use_progressive=True`` — :func:`blend_progressive` takes one
+      contiguous slice per file, advancing a per-file cursor so the entire
+      archive is covered exhaustively over multiple passes.  *cursor* must be
+      a pre-loaded :class:`~bud.stages.blend.BlendCursor` instance.
+    * ``use_blend=True`` — :func:`blend_archive` picks random cross-boundary
+      slices with no memory of previous selections.
+    * default — :func:`_sample_conversations` samples whole conversations.
 
     Args:
         parsed_dir: Directory containing parsed JSONL conversation files.
         concept_map: DiscoveryMap to accumulate into (pre-loaded to resume).
         llm: LLMClient instance from bud.lib.llm.
-        n_samples: Conversations to sample per iteration (ignored when blending).
+        n_samples: Conversations to sample per iteration (whole-conv mode only).
         stability_threshold: Stop early when stability_score >= this value.
         max_iterations: Hard cap on iterations.
         on_iteration: Optional callback(iteration_num, stability_score, concept_map)
             called after the LLM responds and the map is updated.
         on_sampling: Optional callback(iteration_num, max_iterations) called
             immediately before the LLM call so UIs can show a "waiting" state.
-        use_blend: When True, use ``blend_archive`` instead of
-            ``_sample_conversations``.  Blending crosses conversation boundaries,
-            exposing structural patterns invisible to whole-conversation sampling.
-        blend_slices: Number of cross-boundary slices per blended sample.
-        blend_width: Turns per slice when blending.
+        use_blend: Use random cross-boundary blend_archive sampling.
+        blend_slices: Cross-boundary slices per iteration (blend mode only).
+        blend_width: Turns per slice (blend and progressive modes).
+        use_progressive: Use cursor-based progressive blend_progressive sampling.
+        cursor: Pre-loaded BlendCursor (required when use_progressive=True).
 
     Returns:
         The updated DiscoveryMap (also saved to disk after each iteration).
     """
     for i in range(max_iterations):
-        if use_blend:
+        if use_progressive:
+            if cursor is None:
+                raise ValueError("cursor must be provided when use_progressive=True")
+            from bud.stages.blend import blend_progressive
+            sample_text, _file_totals = blend_progressive(
+                parsed_dir, cursor, slice_width=blend_width
+            )
+            if not sample_text:
+                break
+            cursor.save()
+        elif use_blend:
             sample_text = blend_archive(parsed_dir, n_slices=blend_slices, slice_width=blend_width)
             if not sample_text:
                 break

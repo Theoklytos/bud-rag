@@ -170,12 +170,32 @@ def configure():
     default=8,
     help="Turns per blend slice (default: 8)",
 )
-def discover(output_dir, samples, iterations, stability, resume, blend, blend_slices, blend_width):
+@click.option(
+    "--progressive/--no-progressive",
+    default=False,
+    help=(
+        "Progressive cursor-based blending: takes one slice per file per iteration, "
+        "advancing a saved cursor so the entire archive is covered exhaustively. "
+        "Cursor persists across runs; use --reset-cursor to start over."
+    ),
+)
+@click.option(
+    "--reset-cursor",
+    is_flag=True,
+    default=False,
+    help="Reset the progressive blend cursor to the beginning of all files.",
+)
+def discover(output_dir, samples, iterations, stability, resume, blend, blend_slices, blend_width, progressive, reset_cursor):
     """Run the iterative pattern discovery phase.
 
-    Samples conversations randomly and asks the LLM to notice structural,
-    geometric, and topological patterns. Accumulates a concept map that
-    can be injected into the chunking stage via 'bud process --with-discovery'.
+    Samples conversations and asks the LLM to notice structural, geometric,
+    and topological patterns. Accumulates a concept map that can be injected
+    into the chunking stage via 'bud process --with-discovery'.
+
+    Sampling modes (pick one):
+      default      -- random whole-conversation sampling
+      --blend      -- random cross-boundary slices (no memory)
+      --progressive -- cursor-based: one slice per file, exhaustive coverage
     """
     from rich.console import Console
     from rich.progress import (
@@ -199,7 +219,9 @@ def discover(output_dir, samples, iterations, stability, resume, blend, blend_sl
 
     console.print("\n[bold cyan]Bud RAG Pipeline — Discovery Phase[/bold cyan]\n")
     console.print(f"[dim]Output directory: {output_dir}[/dim]")
-    if blend:
+    if progressive:
+        console.print(f"[dim]Mode: progressive ({blend_width} turns/file/iteration)[/dim]")
+    elif blend:
         console.print(f"[dim]Mode: blend ({blend_slices} slices × {blend_width} turns)[/dim]")
     else:
         console.print(f"[dim]Samples per iteration: {samples}[/dim]")
@@ -233,6 +255,23 @@ def discover(output_dir, samples, iterations, stability, resume, blend, blend_sl
             f"stability={concept_map.stability_score:.2f})[/green]\n"
         )
 
+    # Set up progressive cursor if requested
+    cursor = None
+    file_totals: dict = {}
+    if progressive:
+        from bud.stages.blend import BlendCursor
+        cursor = BlendCursor(index_mgr.blend_cursor_path)
+        if reset_cursor:
+            cursor.reset()
+            console.print("[yellow]⚠  Blend cursor reset — starting from the beginning[/yellow]\n")
+        else:
+            cursor.load()
+            if not cursor.is_empty():
+                console.print(
+                    f"[green]✓ Resuming blend cursor "
+                    f"({len(cursor.data)} file(s) tracked)[/green]\n"
+                )
+
     with Progress(
         SpinnerColumn(),
         TextColumn("[progress.description]{task.description}"),
@@ -243,7 +282,12 @@ def discover(output_dir, samples, iterations, stability, resume, blend, blend_sl
         task = progress.add_task("Sampling...", total=None)
 
         def on_sampling(iteration_num, max_iter):
-            mode_tag = "blend" if blend else "sample"
+            if progressive:
+                mode_tag = "progressive"
+            elif blend:
+                mode_tag = "blend"
+            else:
+                mode_tag = "sample"
             progress.update(
                 task,
                 description=(
@@ -280,6 +324,8 @@ def discover(output_dir, samples, iterations, stability, resume, blend, blend_sl
             use_blend=blend,
             blend_slices=blend_slices,
             blend_width=blend_width,
+            use_progressive=progressive,
+            cursor=cursor,
         )
 
     console.print(f"\n[green]✓ Discovery complete![/green]")
@@ -290,6 +336,21 @@ def discover(output_dir, samples, iterations, stability, resume, blend, blend_sl
     console.print(f"  Chunk archetypes: {len(concept_map.data.get('chunk_archetypes', []))}")
     console.print(f"  Anti-patterns: {len(concept_map.data.get('anti_patterns', []))}")
     console.print(f"\n[dim]Concept map saved to: {index_mgr.discovery_map_path}[/dim]")
+
+    if progressive and cursor is not None:
+        from bud.stages.blend import blend_progressive as _bp, _load_turns
+        file_totals = {
+            f.name: len(_load_turns(f))
+            for f in sorted((output_dir / "parsed").glob("*.jsonl"))
+        }
+        coverage = cursor.coverage(file_totals)
+        if coverage:
+            console.print("\n  [dim]Blend cursor coverage:[/dim]")
+            for fname, pct in sorted(coverage.items()):
+                bar = "▓" * int(pct * 20) + "░" * (20 - int(pct * 20))
+                console.print(f"    {bar} {pct*100:.0f}%  {fname}")
+        console.print(f"  [dim]Cursor saved to: {index_mgr.blend_cursor_path}[/dim]")
+
     console.print("[dim]Run 'bud process --with-discovery' to use it for chunking.[/dim]\n")
 
 
