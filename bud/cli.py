@@ -628,10 +628,17 @@ def process(data_dir, output_dir, resume, batch_size, prompt, with_discovery):
                     f"[dim]0/{n_embed} chunks[/dim]"
                 ),
             )
+            batch_embed_errors: list[str] = []
+
+            def _on_error(chunk, error_msg, _errs=batch_embed_errors):
+                if len(_errs) < 1:
+                    _errs.append(error_msg)
+
             failed = embed_chunks(
                 all_chunks_for_embed, embedding_client, store,
                 index_mgr.embed_queue_path,
                 on_chunk=_on_chunk,
+                on_error=_on_error,
             )
 
             if failed < len(all_chunks_for_embed):
@@ -639,6 +646,12 @@ def process(data_dir, output_dir, resume, batch_size, prompt, with_discovery):
             failed_chunks = []
 
             embedded = n_embed - failed
+            if failed > 0:
+                first_err = batch_embed_errors[0] if batch_embed_errors else "unknown error"
+                progress.print(
+                    f"  [yellow]⚠  batch {batch_num}: {failed}/{n_embed} chunks failed to embed[/yellow]\n"
+                    f"    [dim]{first_err}[/dim]"
+                )
             progress.update(
                 op_task,
                 description=(
@@ -672,6 +685,16 @@ def process(data_dir, output_dir, resume, batch_size, prompt, with_discovery):
     if store:
         store.save()
         console.print(f"\n[green]✓ Final index saved ({store.count()} total chunks)[/green]")
+
+    # Warn about queued embed failures
+    from bud.stages.embed import load_embed_queue
+    queued = load_embed_queue(index_mgr.embed_queue_path)
+    if queued:
+        console.print(
+            f"\n[yellow]⚠  {len(queued)} chunk(s) failed to embed and are queued for retry.[/yellow]\n"
+            f"   Fix the embedding service, then run: [bold]bud process --resume[/bold]\n"
+            f"   Queue file: [dim]{index_mgr.embed_queue_path}[/dim]"
+        )
 
     # Print summary
     console.print(f"\n[bold cyan]Pipeline Complete![/bold cyan]")

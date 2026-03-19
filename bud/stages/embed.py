@@ -15,6 +15,7 @@ def embed_chunks(
     store,
     queue_path: str,
     on_chunk=None,
+    on_error=None,
 ) -> int:
     """Embed chunks and add to vector store.
 
@@ -25,6 +26,9 @@ def embed_chunks(
         queue_path: Path to embedding failure queue file
         on_chunk: Optional callback(done: int, total: int) called after each
             chunk attempt (success or failure) for live progress reporting.
+        on_error: Optional callback(chunk: dict, error_msg: str) called for
+            each chunk that fails to embed.  Useful for surfacing failures
+            in the CLI without breaking the batch loop.
 
     Returns:
         Number of chunks that failed to embed
@@ -55,8 +59,10 @@ def embed_chunks(
                 store._create_index()
 
             store.add([vector], [metadata])
-        except EmbeddingError:
+        except EmbeddingError as e:
             failures.append(chunk)
+            if on_error:
+                on_error(chunk, str(e))
         if on_chunk:
             on_chunk(idx, total)
 

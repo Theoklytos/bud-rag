@@ -167,3 +167,170 @@ def test_on_chunk_none_does_not_raise(tmp_path):
     # no on_chunk — should complete without error
     result = embed_chunks(chunks, client, store, str(tmp_path / "q.jsonl"))
     assert result == 0
+
+
+# ---------------------------------------------------------------------------
+# on_error callback tests
+# ---------------------------------------------------------------------------
+
+
+def test_on_error_called_on_embedding_failure(tmp_path):
+    client = _make_embedding_client()
+    client.embed.side_effect = EmbeddingError("connection refused")
+    store = _make_store()
+    chunks = [_make_chunk("bad")]
+    errors = []
+    embed_chunks(
+        chunks, client, store, str(tmp_path / "q.jsonl"),
+        on_error=lambda chunk, msg: errors.append(msg),
+    )
+    assert len(errors) == 1
+    assert "connection refused" in errors[0]
+
+
+def test_on_error_receives_failing_chunk(tmp_path):
+    client = _make_embedding_client()
+    client.embed.side_effect = EmbeddingError("boom")
+    store = _make_store()
+    chunks = [_make_chunk("fail-me")]
+    received = []
+    embed_chunks(
+        chunks, client, store, str(tmp_path / "q.jsonl"),
+        on_error=lambda chunk, msg: received.append(chunk["chunk_id"]),
+    )
+    assert received == ["fail-me"]
+
+
+def test_on_error_not_called_on_success(tmp_path):
+    client = _make_embedding_client()
+    store = _make_store()
+    chunks = [_make_chunk("ok")]
+    errors = []
+    embed_chunks(
+        chunks, client, store, str(tmp_path / "q.jsonl"),
+        on_error=lambda chunk, msg: errors.append(msg),
+    )
+    assert errors == []
+
+
+def test_on_error_none_does_not_raise_on_failure(tmp_path):
+    client = _make_embedding_client()
+    client.embed.side_effect = EmbeddingError("boom")
+    store = _make_store()
+    chunks = [_make_chunk("fail")]
+    # no on_error — should still queue the failure without crashing
+    result = embed_chunks(chunks, client, store, str(tmp_path / "q.jsonl"))
+    assert result == 1
+
+
+def test_on_error_called_for_each_failing_chunk(tmp_path):
+    client = _make_embedding_client()
+    client.embed.side_effect = EmbeddingError("nope")
+    store = _make_store()
+    chunks = [_make_chunk(f"bad-{i}") for i in range(4)]
+    errors = []
+    embed_chunks(
+        chunks, client, store, str(tmp_path / "q.jsonl"),
+        on_error=lambda chunk, msg: errors.append(chunk["chunk_id"]),
+    )
+    assert len(errors) == 4
+
+
+# ---------------------------------------------------------------------------
+# EmbeddingClient tests
+# ---------------------------------------------------------------------------
+
+
+def test_embedding_client_tries_new_api_first(tmp_path):
+    """Client should POST to /api/embed before /api/embeddings."""
+    from unittest.mock import patch as _patch
+    import requests
+
+    config = {
+        "embeddings": {"provider": "ollama", "base_url": "http://localhost:11434", "model": "test"},
+        "llm": {"timeout_seconds": 10},
+    }
+    from bud.lib.embeddings import EmbeddingClient
+
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = {"embeddings": [[0.1, 0.2, 0.3]]}
+
+    with _patch("requests.post", return_value=mock_resp) as mock_post:
+        client = EmbeddingClient(config)
+        result = client.embed("hello")
+
+    first_call_url = mock_post.call_args_list[0][0][0]
+    assert "/api/embed" in first_call_url
+    assert result == [0.1, 0.2, 0.3]
+
+
+def test_embedding_client_falls_back_to_legacy_api(tmp_path):
+    """Client falls back to /api/embeddings when /api/embed returns non-200."""
+    from unittest.mock import patch as _patch, call as _call
+
+    config = {
+        "embeddings": {"provider": "ollama", "base_url": "http://localhost:11434", "model": "test"},
+        "llm": {"timeout_seconds": 10},
+    }
+    from bud.lib.embeddings import EmbeddingClient
+
+    new_resp = MagicMock()
+    new_resp.status_code = 404
+
+    legacy_resp = MagicMock()
+    legacy_resp.status_code = 200
+    legacy_resp.json.return_value = {"embedding": [0.4, 0.5, 0.6]}
+
+    with _patch("requests.post", side_effect=[new_resp, legacy_resp]) as mock_post:
+        client = EmbeddingClient(config)
+        result = client.embed("hello")
+
+    assert mock_post.call_count == 2
+    assert "/api/embed" in mock_post.call_args_list[0][0][0]
+    assert "/api/embeddings" in mock_post.call_args_list[1][0][0]
+    assert result == [0.4, 0.5, 0.6]
+
+
+def test_embedding_client_raises_on_both_api_failures():
+    """EmbeddingError raised when both endpoints fail."""
+    from unittest.mock import patch as _patch
+    from bud.lib.embeddings import EmbeddingClient
+    from bud.lib.errors import EmbeddingError
+
+    config = {
+        "embeddings": {"provider": "ollama", "base_url": "http://localhost:11434", "model": "test"},
+        "llm": {"timeout_seconds": 10},
+    }
+
+    bad_resp = MagicMock()
+    bad_resp.status_code = 500
+    bad_resp.text = "internal error"
+
+    with _patch("requests.post", return_value=bad_resp):
+        client = EmbeddingClient(config)
+        with pytest.raises(EmbeddingError):
+            client.embed("hello")
+
+
+def test_embedding_client_sets_dimension_after_first_embed():
+    """dimension property is None before first call, set after."""
+    from unittest.mock import patch as _patch
+    from bud.lib.embeddings import EmbeddingClient
+
+    config = {
+        "embeddings": {"provider": "ollama", "base_url": "http://localhost:11434", "model": "test"},
+        "llm": {"timeout_seconds": 10},
+    }
+
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = {"embeddings": [[0.1, 0.2, 0.3, 0.4]]}
+
+    client = EmbeddingClient(config)
+    assert client.dimension is None
+
+    with _patch("requests.post", return_value=mock_resp):
+        client.embed("test")
+
+    assert client.dimension == 4
