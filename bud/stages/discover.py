@@ -147,6 +147,97 @@ class DiscoveryMap:
         return self._data.get("iterations_completed", 0) == 0
 
 
+def _build_turn_pool(parsed_dir: str) -> list[dict]:
+    """Flatten all turns from all conversations into a single ordered pool.
+
+    Each entry carries its parent conversation ID so cross-boundary transitions
+    can be detected and annotated in blended samples.
+    """
+    pool = []
+    for jsonl_file in sorted(Path(parsed_dir).glob("*.jsonl")):
+        try:
+            with open(jsonl_file) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        conv = json.loads(line)
+                        conv_id = conv.get("id", "?")
+                        conv_name = conv.get("conversation_name", "")
+                        for turn in conv.get("turns", []):
+                            pool.append({
+                                "conv_id": conv_id,
+                                "conv_name": conv_name,
+                                "sender": turn.get("sender", "?"),
+                                "text": turn.get("text", ""),
+                            })
+                    except json.JSONDecodeError:
+                        pass
+        except OSError:
+            pass
+    return pool
+
+
+def blend_archive(
+    parsed_dir: str,
+    n_slices: int = 6,
+    slice_width: int = 8,
+    max_chars_per_turn: int = 300,
+    rng: "random.Random | None" = None,
+) -> str:
+    """Build a blended sample by slicing across conversation boundaries.
+
+    Unlike ``_sample_conversations`` (which picks whole conversations),
+    this treats every turn from every conversation as a flat pool and cuts
+    at arbitrary positions.  Cross-conversation slices expose structural
+    patterns — turn syntax, sender alternation, topic-transition markers —
+    that are invisible when sampling complete conversational units.
+
+    The resulting text looks like a surrealist transcript: topics jump
+    mid-thought, speakers change context, conversations end abruptly and
+    begin elsewhere.  This forces the LLM to reason about geometry and
+    structure rather than semantic content.
+
+    Args:
+        parsed_dir: Directory containing parsed JSONL conversation files.
+        n_slices: Number of independent random slices to include.
+        slice_width: Number of consecutive turns per slice.
+        max_chars_per_turn: Truncation limit for each turn's text.
+        rng: Optional seeded ``random.Random`` instance (for reproducibility).
+
+    Returns:
+        Formatted multi-slice string ready to send to the LLM, or ``""``
+        if the parsed directory is empty.
+    """
+    if rng is None:
+        rng = random.Random()
+
+    pool = _build_turn_pool(parsed_dir)
+    if not pool:
+        return ""
+
+    parts = []
+    for slice_num in range(n_slices):
+        max_start = max(0, len(pool) - slice_width)
+        start = rng.randint(0, max_start)
+        turns = pool[start : start + slice_width]
+
+        lines = [f"--- blend slice {slice_num + 1} (pool offset {start}) ---"]
+        prev_conv_id = None
+        for turn in turns:
+            if prev_conv_id is not None and turn["conv_id"] != prev_conv_id:
+                lines.append("[[ CONVERSATION BOUNDARY ]]")
+            sender = turn["sender"]
+            text = turn["text"][:max_chars_per_turn]
+            lines.append(f"[{sender}]: {text}")
+            prev_conv_id = turn["conv_id"]
+
+        parts.append("\n".join(lines))
+
+    return "\n\n".join(parts)
+
+
 def _sample_conversations(parsed_dir: str, n: int) -> list[dict]:
     """Randomly sample up to n conversations from parsed JSONL files."""
     all_conversations = []
@@ -198,30 +289,44 @@ def run_discovery(
     stability_threshold: float = 0.75,
     max_iterations: int = 10,
     on_iteration: Optional[Callable] = None,
+    use_blend: bool = False,
+    blend_slices: int = 6,
+    blend_width: int = 8,
 ) -> DiscoveryMap:
     """Run the iterative pattern discovery loop.
 
-    Randomly samples conversations, asks the LLM to notice structural patterns,
-    and accumulates a concept map until stability is reached or max_iterations hit.
+    Each iteration either samples whole conversations (default) or builds a
+    cross-boundary blended sample (``use_blend=True``), asks the LLM to notice
+    structural patterns, and accumulates a concept map until stability is reached
+    or ``max_iterations`` is hit.
 
     Args:
         parsed_dir: Directory containing parsed JSONL conversation files.
         concept_map: DiscoveryMap to accumulate into (pre-loaded to resume).
         llm: LLMClient instance from bud.lib.llm.
-        n_samples: Conversations to sample per iteration.
+        n_samples: Conversations to sample per iteration (ignored when blending).
         stability_threshold: Stop early when stability_score >= this value.
         max_iterations: Hard cap on iterations.
         on_iteration: Optional callback(iteration_num, stability_score, concept_map).
+        use_blend: When True, use ``blend_archive`` instead of
+            ``_sample_conversations``.  Blending crosses conversation boundaries,
+            exposing structural patterns invisible to whole-conversation sampling.
+        blend_slices: Number of cross-boundary slices per blended sample.
+        blend_width: Turns per slice when blending.
 
     Returns:
         The updated DiscoveryMap (also saved to disk after each iteration).
     """
     for i in range(max_iterations):
-        samples = _sample_conversations(parsed_dir, n_samples)
-        if not samples:
-            break
-
-        sample_text = _format_samples(samples)
+        if use_blend:
+            sample_text = blend_archive(parsed_dir, n_slices=blend_slices, slice_width=blend_width)
+            if not sample_text:
+                break
+        else:
+            samples = _sample_conversations(parsed_dir, n_samples)
+            if not samples:
+                break
+            sample_text = _format_samples(samples)
         current_map_json = json.dumps(concept_map.data, indent=2)
 
         user_prompt = DISCOVERY_USER_TEMPLATE.format(

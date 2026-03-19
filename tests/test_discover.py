@@ -5,10 +5,14 @@ import os
 
 import pytest
 
+import random
+
 from bud.stages.discover import (
     DiscoveryMap,
+    _build_turn_pool,
     _format_samples,
     _sample_conversations,
+    blend_archive,
     run_discovery,
 )
 
@@ -331,6 +335,208 @@ class TestRunDiscovery:
         )
         assert dm.iterations_completed == 0
         llm.complete.assert_not_called()
+
+# ---------------------------------------------------------------------------
+# _build_turn_pool tests
+# ---------------------------------------------------------------------------
+
+
+class TestBuildTurnPool:
+    def test_empty_dir_returns_empty(self, tmp_path):
+        assert _build_turn_pool(str(tmp_path)) == []
+
+    def test_flattens_all_turns(self, tmp_path):
+        conv2 = {**SAMPLE_CONVERSATION, "id": "conv-2", "conversation_name": "Other"}
+        _write_jsonl(tmp_path / "conversations_1.jsonl", [SAMPLE_CONVERSATION, conv2])
+        pool = _build_turn_pool(str(tmp_path))
+        # 4 turns from conv-1 + 4 turns from conv-2
+        assert len(pool) == 8
+
+    def test_each_entry_has_required_keys(self, tmp_path):
+        _write_jsonl(tmp_path / "conversations_1.jsonl", [SAMPLE_CONVERSATION])
+        pool = _build_turn_pool(str(tmp_path))
+        for entry in pool:
+            assert "conv_id" in entry
+            assert "conv_name" in entry
+            assert "sender" in entry
+            assert "text" in entry
+
+    def test_conv_id_matches_conversation(self, tmp_path):
+        _write_jsonl(tmp_path / "conversations_1.jsonl", [SAMPLE_CONVERSATION])
+        pool = _build_turn_pool(str(tmp_path))
+        assert all(e["conv_id"] == "conv-1" for e in pool)
+
+    def test_skips_corrupt_lines(self, tmp_path):
+        p = tmp_path / "conversations_1.jsonl"
+        p.write_text(json.dumps(SAMPLE_CONVERSATION) + "\nnot json\n")
+        pool = _build_turn_pool(str(tmp_path))
+        assert len(pool) == 4  # only the valid conversation's turns
+
+    def test_multiple_files_merged(self, tmp_path):
+        conv2 = {**SAMPLE_CONVERSATION, "id": "conv-2"}
+        _write_jsonl(tmp_path / "conversations_1.jsonl", [SAMPLE_CONVERSATION])
+        _write_jsonl(tmp_path / "conversations_2.jsonl", [conv2])
+        pool = _build_turn_pool(str(tmp_path))
+        assert len(pool) == 8
+        conv_ids = {e["conv_id"] for e in pool}
+        assert conv_ids == {"conv-1", "conv-2"}
+
+
+# ---------------------------------------------------------------------------
+# blend_archive tests
+# ---------------------------------------------------------------------------
+
+
+class TestBlendArchive:
+    def _make_multi_conv_dir(self, tmp_path):
+        """Write two conversations (8 turns each) to parsed dir."""
+        conv2 = {
+            **SAMPLE_CONVERSATION,
+            "id": "conv-2",
+            "conversation_name": "Second Chat",
+            "turns": [
+                {"sender": "human", "text": f"question {i}"}
+                if i % 2 == 0
+                else {"sender": "assistant", "text": f"answer {i}"}
+                for i in range(8)
+            ],
+        }
+        _write_jsonl(tmp_path / "conversations_1.jsonl", [SAMPLE_CONVERSATION, conv2])
+        return str(tmp_path)
+
+    def test_empty_dir_returns_empty_string(self, tmp_path):
+        result = blend_archive(str(tmp_path))
+        assert result == ""
+
+    def test_returns_string(self, tmp_path):
+        self._make_multi_conv_dir(tmp_path)
+        result = blend_archive(str(tmp_path), n_slices=2, slice_width=3)
+        assert isinstance(result, str)
+        assert len(result) > 0
+
+    def test_contains_slice_headers(self, tmp_path):
+        self._make_multi_conv_dir(tmp_path)
+        result = blend_archive(str(tmp_path), n_slices=3, slice_width=2)
+        assert "blend slice 1" in result
+        assert "blend slice 2" in result
+        assert "blend slice 3" in result
+
+    def test_contains_sender_labels(self, tmp_path):
+        self._make_multi_conv_dir(tmp_path)
+        result = blend_archive(str(tmp_path), n_slices=2, slice_width=4)
+        assert "[human]:" in result or "[assistant]:" in result
+
+    def test_marks_conversation_boundaries(self, tmp_path):
+        """When a slice crosses conversation boundaries the marker appears."""
+        # Two conversations, force a seeded rng that crosses the boundary.
+        # Pool is 12 turns: 0-3 conv-1, 4-11 conv-2.  slice_width=6 starting
+        # at offset 2 will span both conversations.
+        self._make_multi_conv_dir(tmp_path)
+        rng = random.Random(0)
+        # Override randint to always return 2 (crosses boundary at turn 4)
+        rng.randint = lambda a, b: 2
+        result = blend_archive(str(tmp_path), n_slices=1, slice_width=6, rng=rng)
+        assert "CONVERSATION BOUNDARY" in result
+
+    def test_respects_max_chars_per_turn(self, tmp_path):
+        long_conv = {
+            **SAMPLE_CONVERSATION,
+            "turns": [{"sender": "human", "text": "x" * 500}],
+        }
+        _write_jsonl(tmp_path / "conversations_1.jsonl", [long_conv])
+        result = blend_archive(str(tmp_path), n_slices=1, slice_width=1, max_chars_per_turn=50)
+        assert "x" * 50 in result
+        assert "x" * 51 not in result
+
+    def test_reproducible_with_seeded_rng(self, tmp_path):
+        self._make_multi_conv_dir(tmp_path)
+        r1 = blend_archive(str(tmp_path), n_slices=3, slice_width=3, rng=random.Random(42))
+        r2 = blend_archive(str(tmp_path), n_slices=3, slice_width=3, rng=random.Random(42))
+        assert r1 == r2
+
+    def test_different_seeds_produce_different_output(self, tmp_path):
+        self._make_multi_conv_dir(tmp_path)
+        r1 = blend_archive(str(tmp_path), n_slices=4, slice_width=3, rng=random.Random(1))
+        r2 = blend_archive(str(tmp_path), n_slices=4, slice_width=3, rng=random.Random(99))
+        # Very unlikely to be identical with 12-turn pool and 4 random slices
+        assert r1 != r2
+
+    def test_slice_width_larger_than_pool_does_not_crash(self, tmp_path):
+        """When slice_width > pool size, just returns all turns once."""
+        _write_jsonl(tmp_path / "conversations_1.jsonl", [SAMPLE_CONVERSATION])
+        result = blend_archive(str(tmp_path), n_slices=1, slice_width=1000)
+        assert len(result) > 0
+
+
+# ---------------------------------------------------------------------------
+# run_discovery blend mode tests
+# ---------------------------------------------------------------------------
+
+
+class TestRunDiscoveryBlendMode:
+    def _make_llm(self):
+        from unittest.mock import MagicMock
+
+        llm = MagicMock()
+        llm.complete.return_value = json.dumps(SAMPLE_RESPONSE)
+        return llm
+
+    def _make_parsed_dir(self, tmp_path):
+        parsed = tmp_path / "parsed"
+        parsed.mkdir()
+        conv2 = {**SAMPLE_CONVERSATION, "id": "conv-2"}
+        _write_jsonl(parsed / "conversations_1.jsonl", [SAMPLE_CONVERSATION, conv2])
+        return str(parsed)
+
+    def test_blend_mode_runs_and_updates_map(self, tmp_path):
+        llm = self._make_llm()
+        dm = DiscoveryMap(str(tmp_path / "dm.json"))
+        run_discovery(
+            parsed_dir=self._make_parsed_dir(tmp_path),
+            concept_map=dm,
+            llm=llm,
+            max_iterations=2,
+            use_blend=True,
+            blend_slices=3,
+            blend_width=3,
+        )
+        assert dm.iterations_completed == 2
+
+    def test_blend_mode_empty_dir_returns_immediately(self, tmp_path):
+        empty = tmp_path / "empty"
+        empty.mkdir()
+        llm = self._make_llm()
+        dm = DiscoveryMap(str(tmp_path / "dm.json"))
+        run_discovery(
+            parsed_dir=str(empty),
+            concept_map=dm,
+            llm=llm,
+            max_iterations=5,
+            use_blend=True,
+        )
+        assert dm.iterations_completed == 0
+        llm.complete.assert_not_called()
+
+    def test_blend_mode_llm_receives_slice_headers(self, tmp_path):
+        """The prompt sent to the LLM contains blend slice markers."""
+        from unittest.mock import MagicMock
+
+        llm = MagicMock()
+        llm.complete.return_value = json.dumps(SAMPLE_RESPONSE)
+        dm = DiscoveryMap(str(tmp_path / "dm.json"))
+        run_discovery(
+            parsed_dir=self._make_parsed_dir(tmp_path),
+            concept_map=dm,
+            llm=llm,
+            max_iterations=1,
+            use_blend=True,
+            blend_slices=2,
+            blend_width=3,
+        )
+        call_args = llm.complete.call_args
+        user_prompt = call_args[1].get("user") or call_args[0][1]
+        assert "blend slice" in user_prompt
+
 
     def test_strips_markdown_fences_from_response(self, tmp_path):
         from unittest.mock import MagicMock

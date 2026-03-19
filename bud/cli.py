@@ -149,7 +149,28 @@ def configure():
     default=False,
     help="Resume from existing concept map",
 )
-def discover(output_dir, samples, iterations, stability, resume):
+@click.option(
+    "--blend/--no-blend",
+    default=False,
+    help=(
+        "Use cross-boundary blending instead of whole-conversation sampling. "
+        "Slices randomly across all turns in the archive, crossing conversation "
+        "boundaries, to expose structural patterns invisible to per-conversation sampling."
+    ),
+)
+@click.option(
+    "--blend-slices", "-S",
+    type=int,
+    default=6,
+    help="Number of cross-boundary slices per blended sample (default: 6)",
+)
+@click.option(
+    "--blend-width", "-W",
+    type=int,
+    default=8,
+    help="Turns per blend slice (default: 8)",
+)
+def discover(output_dir, samples, iterations, stability, resume, blend, blend_slices, blend_width):
     """Run the iterative pattern discovery phase.
 
     Samples conversations randomly and asks the LLM to notice structural,
@@ -176,7 +197,10 @@ def discover(output_dir, samples, iterations, stability, resume):
 
     console.print("\n[bold cyan]Bud RAG Pipeline — Discovery Phase[/bold cyan]\n")
     console.print(f"[dim]Output directory: {output_dir}[/dim]")
-    console.print(f"[dim]Samples per iteration: {samples}[/dim]")
+    if blend:
+        console.print(f"[dim]Mode: blend ({blend_slices} slices × {blend_width} turns)[/dim]")
+    else:
+        console.print(f"[dim]Samples per iteration: {samples}[/dim]")
     console.print(f"[dim]Max iterations: {iterations}[/dim]")
     console.print(f"[dim]Stability threshold: {stability}[/dim]\n")
 
@@ -233,6 +257,9 @@ def discover(output_dir, samples, iterations, stability, resume):
             stability_threshold=stability,
             max_iterations=iterations,
             on_iteration=on_iteration,
+            use_blend=blend,
+            blend_slices=blend_slices,
+            blend_width=blend_width,
         )
 
     console.print(f"\n[green]✓ Discovery complete![/green]")
