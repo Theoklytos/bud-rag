@@ -26,3 +26,6 @@ dev = [
 
 [tool.hatch.build.targets.wheel]
 packages = ["bud"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
