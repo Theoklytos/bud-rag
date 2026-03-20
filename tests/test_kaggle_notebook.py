@@ -106,3 +106,18 @@ def test_write_kernel_package(tmp_path):
     with open(script_path) as f:
         loaded_source = f.read()
     assert loaded_source == source
+
+
+def test_generate_kernel_metadata_with_dataset_sources():
+    """Verify dataset_sources appear in metadata when provided."""
+    meta = generate_kernel_metadata(
+        username="alice",
+        dataset_sources=["alice/bud-ollama-cache"],
+    )
+    assert meta["dataset_sources"] == ["alice/bud-ollama-cache"]
+
+
+def test_generate_kernel_metadata_no_dataset_sources():
+    """Verify dataset_sources absent when not provided."""
+    meta = generate_kernel_metadata(username="alice")
+    assert "dataset_sources" not in meta
