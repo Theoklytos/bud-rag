@@ -104,3 +104,30 @@ def test_validate_config_rejects_invalid_embedding_provider():
     bad = {**VALID_CONFIG, "embeddings": bad_emb}
     ok, errors = cfg.validate_config(bad)
     assert ok is False
+
+
+def test_validate_config_kaggle_section():
+    """Verify kaggle section validation passes when valid."""
+    config = {
+        "data_dir": "/tmp/data",
+        "output_dir": "/tmp/out",
+        "llm": {"provider": "ollama", "base_url": "http://localhost:11434", "model": "m"},
+        "embeddings": {"provider": "ollama", "base_url": "http://localhost:11434", "model": "m"},
+        "kaggle": {"ngrok_static_domain": "example.ngrok-free.dev"},
+    }
+    valid, errors = cfg.validate_config(config)
+    assert valid, errors
+
+
+def test_validate_config_kaggle_missing_domain():
+    """Verify kaggle section requires ngrok_static_domain when present."""
+    config = {
+        "data_dir": "/tmp/data",
+        "output_dir": "/tmp/out",
+        "llm": {"provider": "ollama", "base_url": "http://localhost:11434", "model": "m"},
+        "embeddings": {"provider": "ollama", "base_url": "http://localhost:11434", "model": "m"},
+        "kaggle": {"username": "alice"},
+    }
+    valid, errors = cfg.validate_config(config)
+    assert not valid
+    assert any("ngrok_static_domain" in e for e in errors)

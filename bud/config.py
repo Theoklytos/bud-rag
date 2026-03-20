@@ -14,7 +14,7 @@ DEFAULT_CONFIG = {
     "llm": {
         "provider": "ollama",
         "base_url": "http://localhost:11434",
-        "model": "gemini-3-flash-preview:latest",
+        "model": "qwen3.5:397b-cloud",
     },
     "embeddings": {
         "provider": "ollama",
@@ -43,15 +43,34 @@ def ensure_config_dir() -> Path:
     return CONFIG_DIR
 
 
+def _expand_env_vars(obj):
+    """Recursively expand ${VAR_NAME} references in string values."""
+    import re
+
+    if isinstance(obj, str):
+        def _replacer(m):
+            return os.environ.get(m.group(1), m.group(0))
+        return re.sub(r"\$\{(\w+)\}", _replacer, obj)
+    elif isinstance(obj, dict):
+        return {k: _expand_env_vars(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [_expand_env_vars(item) for item in obj]
+    return obj
+
+
 def load_config() -> dict:
-    """Load configuration from config file."""
+    """Load configuration from config file.
+
+    String values containing ``${VAR_NAME}`` are expanded from
+    ``os.environ`` at load time.
+    """
     if not CONFIG_FILE.exists():
         return DEFAULT_CONFIG.copy()
 
     try:
         with open(CONFIG_FILE, "r") as f:
             config = yaml.safe_load(f) or {}
-        return config
+        return _expand_env_vars(config)
     except yaml.YAMLError:
         return DEFAULT_CONFIG.copy()
 
@@ -121,6 +140,11 @@ def validate_config(config: dict) -> tuple[bool, list[str]]:
         errors.append("embeddings.base_url must be a valid HTTP/HTTPS URL")
     if not embeddings.get("model"):
         errors.append("embeddings.model is required")
+
+    # Kaggle GPU configuration (optional)
+    kaggle = config.get("kaggle", {})
+    if kaggle and not kaggle.get("ngrok_static_domain"):
+        errors.append("kaggle.ngrok_static_domain is required when kaggle section is present")
 
     return len(errors) == 0, errors
 
