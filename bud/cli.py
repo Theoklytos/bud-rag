@@ -166,6 +166,98 @@ def models_command():
     )
 
 
+@main.command("parse")
+@click.option(
+    "--data-dir", "-d",
+    type=click.Path(exists=True, file_okay=False, resolve_path=True),
+    help="Path to input data directory (overrides config)",
+)
+@click.option(
+    "--output-dir", "-o",
+    type=click.Path(file_okay=False, resolve_path=True),
+    help="Path to output directory (overrides config)",
+)
+def parse_command(data_dir, output_dir):
+    """Parse raw conversation files into JSONL format.
+
+    Reads conversations_*.json files from the data directory and writes
+    parsed JSONL files to output_dir/parsed/. Run this before 'bud discover'.
+    """
+    from rich.console import Console
+    console = Console()
+
+    if data_dir:
+        data_dir = Path(data_dir)
+    else:
+        data_dir = get_data_dir()
+
+    if output_dir:
+        output_dir = Path(output_dir)
+    else:
+        output_dir = get_output_dir()
+
+    parsed_dir = output_dir / "parsed"
+
+    console.print(f"\n[bold cyan]Bud RAG Pipeline — Parse Stage[/bold cyan]\n")
+    console.print(f"[dim]Data directory: {data_dir}[/dim]")
+    console.print(f"[dim]Output directory: {parsed_dir}[/dim]\n")
+
+    conv_files = sorted(data_dir.glob("conversations_*.json"))
+    if not conv_files:
+        console.print(f"[yellow]No conversations_*.json files found in {data_dir}[/yellow]")
+        return
+
+    console.print(f"[green]✓ Found {len(conv_files)} conversation file(s)[/green]\n")
+
+    from bud.stages.parse import parse_all
+    total = parse_all(data_dir, parsed_dir)
+
+    console.print(f"[green]✓ Parsed {total} conversations → {parsed_dir}[/green]")
+    console.print(f"\n[dim]Run 'bud discover' to analyse patterns.[/dim]\n")
+
+
+@main.command("gpu")
+@click.option("--start", is_flag=True, default=False, help="Start the Kaggle GPU kernel")
+@click.option("--stop", is_flag=True, default=False, help="Stop the Kaggle GPU kernel")
+@click.option("--status", "show_status", is_flag=True, default=False, help="Show GPU kernel status")
+def gpu_command(start, stop, show_status):
+    """Manage the Kaggle GPU kernel."""
+    from rich.console import Console
+    console = Console()
+
+    config = load_config()
+    kaggle_cfg = config.get("kaggle", {})
+
+    if not kaggle_cfg.get("ngrok_static_domain"):
+        console.print(
+            "[yellow]No kaggle.ngrok_static_domain configured. "
+            "Run 'bud configure' to set it up.[/yellow]"
+        )
+        return
+
+    from bud.lib.kaggle_gpu import KaggleGPUManager, _build_config
+    manager = KaggleGPUManager(_build_config(config))
+
+    if start:
+        console.print("[cyan]Starting Kaggle GPU kernel...[/cyan]")
+        try:
+            url = manager.start()
+            console.print(f"[green]Kernel started at: {url}[/green]")
+        except Exception as e:
+            console.print(f"[red]Failed to start kernel: {e}[/red]")
+    elif stop:
+        console.print("[cyan]Stopping Kaggle GPU kernel...[/cyan]")
+        manager.stop()
+        console.print("[green]Cancel request sent.[/green]")
+    elif show_status:
+        if manager.is_running:
+            console.print(f"[green]Kaggle GPU kernel is running at {manager.config.health_url}[/green]")
+        else:
+            console.print("[yellow]Kaggle GPU kernel is not running.[/yellow]")
+    else:
+        console.print("[dim]Use --start, --stop, or --status.[/dim]")
+
+
 @main.command()
 @click.option(
     "--output-dir", "-o",
@@ -322,61 +414,63 @@ def discover(output_dir, samples, iterations, stability, resume, blend, blend_sl
                     f"({len(cursor.data)} file(s) tracked)[/green]\n"
                 )
 
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        TimeElapsedColumn(),
-        console=console,
-        refresh_per_second=8,
-    ) as progress:
-        task = progress.add_task("Sampling...", total=None)
+    from bud.lib.kaggle_gpu import kaggle_gpu_session
+    with kaggle_gpu_session(config):
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            TimeElapsedColumn(),
+            console=console,
+            refresh_per_second=8,
+        ) as progress:
+            task = progress.add_task("Sampling...", total=None)
 
-        def on_sampling(iteration_num, max_iter):
-            if progressive:
-                mode_tag = "progressive"
-            elif blend:
-                mode_tag = "blend"
-            else:
-                mode_tag = "sample"
-            progress.update(
-                task,
-                description=(
-                    f"[dim]iter {iteration_num}/{max_iter}  "
-                    f"{mode_tag}  "
-                    f"waiting for LLM...[/dim]"
-                ),
+            def on_sampling(iteration_num, max_iter):
+                if progressive:
+                    mode_tag = "progressive"
+                elif blend:
+                    mode_tag = "blend"
+                else:
+                    mode_tag = "sample"
+                progress.update(
+                    task,
+                    description=(
+                        f"[dim]iter {iteration_num}/{max_iter}  "
+                        f"{mode_tag}  "
+                        f"waiting for LLM...[/dim]"
+                    ),
+                )
+
+            def on_iteration(iteration_num, score, cmap):
+                signals   = len(cmap.data.get("boundary_signals", []))
+                archetypes = len(cmap.data.get("chunk_archetypes", []))
+                anchors   = len(cmap.data.get("coherence_anchors", []))
+                stable_bar = "▓" * int(score * 10) + "░" * (10 - int(score * 10))
+                progress.update(
+                    task,
+                    description=(
+                        f"iter {iteration_num}/{iterations}  "
+                        f"[{'green' if score >= stability else 'yellow'}]{stable_bar}[/{'green' if score >= stability else 'yellow'}] "
+                        f"stability={score:.2f}  "
+                        f"[dim]signals={signals}  archetypes={archetypes}  anchors={anchors}[/dim]"
+                    ),
+                )
+
+            concept_map = run_discovery(
+                parsed_dir=str(parsed_dir),
+                concept_map=concept_map,
+                llm=llm,
+                n_samples=samples,
+                stability_threshold=stability,
+                max_iterations=iterations,
+                on_iteration=on_iteration,
+                on_sampling=on_sampling,
+                use_blend=blend,
+                blend_slices=blend_slices,
+                blend_width=blend_width,
+                use_progressive=progressive,
+                cursor=cursor,
             )
-
-        def on_iteration(iteration_num, score, cmap):
-            signals   = len(cmap.data.get("boundary_signals", []))
-            archetypes = len(cmap.data.get("chunk_archetypes", []))
-            anchors   = len(cmap.data.get("coherence_anchors", []))
-            stable_bar = "▓" * int(score * 10) + "░" * (10 - int(score * 10))
-            progress.update(
-                task,
-                description=(
-                    f"iter {iteration_num}/{iterations}  "
-                    f"[{'green' if score >= stability else 'yellow'}]{stable_bar}[/{'green' if score >= stability else 'yellow'}] "
-                    f"stability={score:.2f}  "
-                    f"[dim]signals={signals}  archetypes={archetypes}  anchors={anchors}[/dim]"
-                ),
-            )
-
-        concept_map = run_discovery(
-            parsed_dir=str(parsed_dir),
-            concept_map=concept_map,
-            llm=llm,
-            n_samples=samples,
-            stability_threshold=stability,
-            max_iterations=iterations,
-            on_iteration=on_iteration,
-            on_sampling=on_sampling,
-            use_blend=blend,
-            blend_slices=blend_slices,
-            blend_width=blend_width,
-            use_progressive=progressive,
-            cursor=cursor,
-        )
 
     console.print(f"\n[green]✓ Discovery complete![/green]")
     console.print(f"  Iterations: {concept_map.iterations_completed}")
@@ -531,235 +625,237 @@ def process(data_dir, output_dir, resume, batch_size, prompt, with_discovery):
         if failed_chunks:
             console.print(f"[yellow]✓ Resuming {len(failed_chunks)} failed embeddings[/yellow]")
 
-    # Initialize LLM and embedding clients
-    from bud.lib.llm import LLMClient
-    from bud.lib.embeddings import EmbeddingClient
-    llm = LLMClient(config)
-    embedding_client = EmbeddingClient(config)
+    from bud.lib.kaggle_gpu import kaggle_gpu_session
+    with kaggle_gpu_session(config):
+        # Initialize LLM and embedding clients
+        from bud.lib.llm import LLMClient
+        from bud.lib.embeddings import EmbeddingClient
+        llm = LLMClient(config)
+        embedding_client = EmbeddingClient(config)
 
-    # Initialize prompt loader
-    from bud.lib.prompt_loader import PromptLoader
-    prompts_dir = str(Path(__file__).parent / "prompts")
-    prompt_loader = PromptLoader(prompts_dir)
-    system_prompt = prompt_loader.load(prompt, {
-        "owner_name": "User",
-        "schema": json.dumps(schema["dimensions"], indent=2),
-        "file_context": f"{len(conv_files)} conversation files",
-    })
+        # Initialize prompt loader
+        from bud.lib.prompt_loader import PromptLoader
+        prompts_dir = str(Path(__file__).parent / "prompts")
+        prompt_loader = PromptLoader(prompts_dir)
+        system_prompt = prompt_loader.load(prompt, {
+            "owner_name": "User",
+            "schema": json.dumps(schema["dimensions"], indent=2),
+            "file_context": f"{len(conv_files)} conversation files",
+        })
 
-    # Load discovery concept map if requested
-    concept_map_summary = None
-    if with_discovery:
-        from bud.stages.discover import DiscoveryMap
-        dm = DiscoveryMap(index_mgr.discovery_map_path).load()
-        if dm.is_empty():
-            console.print(
-                "[yellow]⚠ No discovery map found. Run 'bud discover' first, "
-                "or omit --with-discovery.[/yellow]\n"
-            )
-        else:
-            concept_map_summary = dm.to_summary()
-            console.print(
-                f"[green]✓ Loaded discovery map "
-                f"({dm.iterations_completed} iterations, "
-                f"stability={dm.stability_score:.2f})[/green]"
-            )
-
-    # Parse conversations
-    parsed_dir = output_dir / "parsed"
-    from bud.stages.parse import parse_conversations_file, parse_all
-
-    console.print("[cyan]→ Parsing conversations[/cyan]")
-    total_conversations = parse_all(data_dir, parsed_dir)
-
-    # Load parsed conversations
-    parsed_files = sorted(parsed_dir.glob("conversations_*.jsonl"))
-    all_conversations = []
-    for pf in parsed_files:
-        with open(pf) as f:
-            for line in f:
-                all_conversations.append(json.loads(line.strip()))
-
-    console.print(f"[green]✓ Parsed {total_conversations} conversations[/green]\n")
-
-    # Process in batches
-    from bud.stages.chunk import chunk_conversation
-    from bud.stages.embed import embed_chunks, clear_embed_queue
-
-    total_chunks = 0
-    errors = 0
-
-    n_convs = len(all_conversations)
-    n_batches = max(1, (n_convs + batch_size - 1) // batch_size)
-
-    console.print(f"[cyan]→ Chunking and embedding {n_convs} conversations[/cyan]")
-
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(bar_width=28),
-        MofNCompleteColumn(),
-        TimeElapsedColumn(),
-        console=console,
-        refresh_per_second=8,
-    ) as progress:
-        conv_task  = progress.add_task("[cyan]Conversations[/cyan]", total=n_convs)
-        op_task    = progress.add_task("", total=None)
-
-        conv_idx = 0
-        for i in range(0, n_convs, batch_size):
-            batch = all_conversations[i:i + batch_size]
-            batch_num = i // batch_size + 1
-            filename = f"conversations_{batch_num}.jsonl"
-
-            # Skip already-processed batches when resuming
-            if resume and tracker.is_complete(filename, batch_num):
-                progress.update(conv_task, advance=len(batch))
-                conv_idx += len(batch)
-                progress.update(
-                    op_task,
-                    description=f"[dim]skipped batch {batch_num}/{n_batches} (already done)[/dim]",
+        # Load discovery concept map if requested
+        concept_map_summary = None
+        if with_discovery:
+            from bud.stages.discover import DiscoveryMap
+            dm = DiscoveryMap(index_mgr.discovery_map_path).load()
+            if dm.is_empty():
+                console.print(
+                    "[yellow]⚠ No discovery map found. Run 'bud discover' first, "
+                    "or omit --with-discovery.[/yellow]\n"
                 )
-                continue
-
-            # --- Chunking ---
-            batch_chunks = []
-            for conv in batch:
-                conv_idx += 1
-                name = (conv.get("conversation_name") or conv["id"])[:52]
-                progress.update(
-                    op_task,
-                    description=(
-                        f"[yellow]chunk[/yellow]  "
-                        f"batch {batch_num}/{n_batches}  "
-                        f"[dim]{name}[/dim]"
-                    ),
+            else:
+                concept_map_summary = dm.to_summary()
+                console.print(
+                    f"[green]✓ Loaded discovery map "
+                    f"({dm.iterations_completed} iterations, "
+                    f"stability={dm.stability_score:.2f})[/green]"
                 )
-                try:
-                    chunks = chunk_conversation(
-                        conv, schema, llm, config, system_prompt, prompt_preset=prompt,
-                        schema_version=schema["version"],
-                        concept_map_summary=concept_map_summary,
+
+        # Parse conversations
+        parsed_dir = output_dir / "parsed"
+        from bud.stages.parse import parse_conversations_file, parse_all
+
+        console.print("[cyan]→ Parsing conversations[/cyan]")
+        total_conversations = parse_all(data_dir, parsed_dir)
+
+        # Load parsed conversations
+        parsed_files = sorted(parsed_dir.glob("conversations_*.jsonl"))
+        all_conversations = []
+        for pf in parsed_files:
+            with open(pf) as f:
+                for line in f:
+                    all_conversations.append(json.loads(line.strip()))
+
+        console.print(f"[green]✓ Parsed {total_conversations} conversations[/green]\n")
+
+        # Process in batches
+        from bud.stages.chunk import chunk_conversation
+        from bud.stages.embed import embed_chunks, clear_embed_queue
+
+        total_chunks = 0
+        errors = 0
+
+        n_convs = len(all_conversations)
+        n_batches = max(1, (n_convs + batch_size - 1) // batch_size)
+
+        console.print(f"[cyan]→ Chunking and embedding {n_convs} conversations[/cyan]")
+
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(bar_width=28),
+            MofNCompleteColumn(),
+            TimeElapsedColumn(),
+            console=console,
+            refresh_per_second=8,
+        ) as progress:
+            conv_task  = progress.add_task("[cyan]Conversations[/cyan]", total=n_convs)
+            op_task    = progress.add_task("", total=None)
+
+            conv_idx = 0
+            for i in range(0, n_convs, batch_size):
+                batch = all_conversations[i:i + batch_size]
+                batch_num = i // batch_size + 1
+                filename = f"conversations_{batch_num}.jsonl"
+
+                # Skip already-processed batches when resuming
+                if resume and tracker.is_complete(filename, batch_num):
+                    progress.update(conv_task, advance=len(batch))
+                    conv_idx += len(batch)
+                    progress.update(
+                        op_task,
+                        description=f"[dim]skipped batch {batch_num}/{n_batches} (already done)[/dim]",
                     )
-                    batch_chunks.extend(chunks)
+                    continue
 
-                    for chunk in chunks:
-                        for proposal in chunk.get("schema_proposals", []):
-                            schema_mgr.propose_candidate(
-                                proposal["dimension"],
-                                proposal["value"],
-                                proposal.get("rationale", "")
-                            )
-                except Exception as e:
-                    errors += 1
-                    progress.print(f"  [red]✗ chunk error  {conv['id']}: {e}[/red]")
+                # --- Chunking ---
+                batch_chunks = []
+                for conv in batch:
+                    conv_idx += 1
+                    name = (conv.get("conversation_name") or conv["id"])[:52]
+                    progress.update(
+                        op_task,
+                        description=(
+                            f"[yellow]chunk[/yellow]  "
+                            f"batch {batch_num}/{n_batches}  "
+                            f"[dim]{name}[/dim]"
+                        ),
+                    )
+                    try:
+                        chunks = chunk_conversation(
+                            conv, schema, llm, config, system_prompt, prompt_preset=prompt,
+                            schema_version=schema["version"],
+                            concept_map_summary=concept_map_summary,
+                        )
+                        batch_chunks.extend(chunks)
 
-                progress.update(conv_task, advance=1)
+                        for chunk in chunks:
+                            for proposal in chunk.get("schema_proposals", []):
+                                schema_mgr.propose_candidate(
+                                    proposal["dimension"],
+                                    proposal["value"],
+                                    proposal.get("rationale", "")
+                                )
+                    except Exception as e:
+                        errors += 1
+                        progress.print(f"  [red]✗ chunk error  {conv['id']}: {e}[/red]")
 
-            total_chunks += len(batch_chunks)
+                    progress.update(conv_task, advance=1)
 
-            # --- Embedding ---
-            all_chunks_for_embed = failed_chunks + batch_chunks
-            n_embed = len(all_chunks_for_embed)
+                total_chunks += len(batch_chunks)
 
-            def _on_chunk(done, total, _batch=batch_num):
+                # --- Embedding ---
+                all_chunks_for_embed = failed_chunks + batch_chunks
+                n_embed = len(all_chunks_for_embed)
+
+                def _on_chunk(done, total, _batch=batch_num):
+                    progress.update(
+                        op_task,
+                        description=(
+                            f"[blue]embed[/blue]   "
+                            f"batch {_batch}/{n_batches}  "
+                            f"[dim]{done}/{total} chunks[/dim]"
+                        ),
+                    )
+
                 progress.update(
                     op_task,
                     description=(
                         f"[blue]embed[/blue]   "
-                        f"batch {_batch}/{n_batches}  "
-                        f"[dim]{done}/{total} chunks[/dim]"
+                        f"batch {batch_num}/{n_batches}  "
+                        f"[dim]0/{n_embed} chunks[/dim]"
+                    ),
+                )
+                batch_embed_errors: list[str] = []
+
+                def _on_error(chunk, error_msg, _errs=batch_embed_errors):
+                    if len(_errs) < 1:
+                        _errs.append(error_msg)
+
+                failed = embed_chunks(
+                    all_chunks_for_embed, embedding_client, store,
+                    index_mgr.embed_queue_path,
+                    on_chunk=_on_chunk,
+                    on_error=_on_error,
+                    max_chars=_model_cfg["max_embed_chars"],
+                )
+
+                if failed < len(all_chunks_for_embed):
+                    clear_embed_queue(index_mgr.embed_queue_path)
+                failed_chunks = []
+
+                embedded = n_embed - failed
+                if failed > 0:
+                    first_err = batch_embed_errors[0] if batch_embed_errors else "unknown error"
+                    progress.print(
+                        f"  [yellow]⚠  batch {batch_num}: {failed}/{n_embed} chunks failed to embed[/yellow]\n"
+                        f"    [dim]{first_err}[/dim]"
+                    )
+                progress.update(
+                    op_task,
+                    description=(
+                        f"[green]✓ batch {batch_num}/{n_batches}[/green]  "
+                        f"[dim]{len(batch_chunks)} chunks  "
+                        f"{embedded} embedded  "
+                        f"{total_chunks} total  "
+                        f"{errors} errors[/dim]"
                     ),
                 )
 
+                tracker.mark_complete(filename, batch_num)
+
             progress.update(
                 op_task,
                 description=(
-                    f"[blue]embed[/blue]   "
-                    f"batch {batch_num}/{n_batches}  "
-                    f"[dim]0/{n_embed} chunks[/dim]"
-                ),
-            )
-            batch_embed_errors: list[str] = []
-
-            def _on_error(chunk, error_msg, _errs=batch_embed_errors):
-                if len(_errs) < 1:
-                    _errs.append(error_msg)
-
-            failed = embed_chunks(
-                all_chunks_for_embed, embedding_client, store,
-                index_mgr.embed_queue_path,
-                on_chunk=_on_chunk,
-                on_error=_on_error,
-                max_chars=_model_cfg["max_embed_chars"],
-            )
-
-            if failed < len(all_chunks_for_embed):
-                clear_embed_queue(index_mgr.embed_queue_path)
-            failed_chunks = []
-
-            embedded = n_embed - failed
-            if failed > 0:
-                first_err = batch_embed_errors[0] if batch_embed_errors else "unknown error"
-                progress.print(
-                    f"  [yellow]⚠  batch {batch_num}: {failed}/{n_embed} chunks failed to embed[/yellow]\n"
-                    f"    [dim]{first_err}[/dim]"
-                )
-            progress.update(
-                op_task,
-                description=(
-                    f"[green]✓ batch {batch_num}/{n_batches}[/green]  "
-                    f"[dim]{len(batch_chunks)} chunks  "
-                    f"{embedded} embedded  "
-                    f"{total_chunks} total  "
+                    f"[bold green]done[/bold green]  "
+                    f"[dim]{total_chunks} chunks  "
+                    f"{store.count() if store else 0} in index  "
                     f"{errors} errors[/dim]"
                 ),
             )
 
-            tracker.mark_complete(filename, batch_num)
+        # Apply schema evolution
+        promoted = schema_mgr.apply_promotions(config)
+        if promoted:
+            console.print(f"\n[yellow]Schema evolved! Promoted: {', '.join(promoted)}[/yellow]")
+            schema = schema_mgr.load()
 
-        progress.update(
-            op_task,
-            description=(
-                f"[bold green]done[/bold green]  "
-                f"[dim]{total_chunks} chunks  "
-                f"{store.count() if store else 0} in index  "
-                f"{errors} errors[/dim]"
-            ),
-        )
+        # Final index save
+        if store:
+            store.save()
+            console.print(f"\n[green]✓ Final index saved ({store.count()} total chunks)[/green]")
 
-    # Apply schema evolution
-    promoted = schema_mgr.apply_promotions(config)
-    if promoted:
-        console.print(f"\n[yellow]Schema evolved! Promoted: {', '.join(promoted)}[/yellow]")
-        schema = schema_mgr.load()
+        # Warn about queued embed failures
+        from bud.stages.embed import load_embed_queue
+        queued = load_embed_queue(index_mgr.embed_queue_path)
+        if queued:
+            console.print(
+                f"\n[yellow]⚠  {len(queued)} chunk(s) failed to embed and are queued for retry.[/yellow]\n"
+                f"   Fix the embedding service, then run: [bold]bud process --resume[/bold]\n"
+                f"   Queue file: [dim]{index_mgr.embed_queue_path}[/dim]"
+            )
 
-    # Final index save
-    if store:
-        store.save()
-        console.print(f"\n[green]✓ Final index saved ({store.count()} total chunks)[/green]")
+        # Print summary
+        console.print(f"\n[bold cyan]Pipeline Complete![/bold cyan]")
+        console.print(f"  Conversations: {total_conversations}")
+        console.print(f"  Chunks: {total_chunks}")
+        console.print(f"  Errors: {errors}")
+        console.print(f"  Schema version: v{schema['version']}")
 
-    # Warn about queued embed failures
-    from bud.stages.embed import load_embed_queue
-    queued = load_embed_queue(index_mgr.embed_queue_path)
-    if queued:
-        console.print(
-            f"\n[yellow]⚠  {len(queued)} chunk(s) failed to embed and are queued for retry.[/yellow]\n"
-            f"   Fix the embedding service, then run: [bold]bud process --resume[/bold]\n"
-            f"   Queue file: [dim]{index_mgr.embed_queue_path}[/dim]"
-        )
+        if promoted:
+            console.print(f"  Promoted: {', '.join(promoted)}")
 
-    # Print summary
-    console.print(f"\n[bold cyan]Pipeline Complete![/bold cyan]")
-    console.print(f"  Conversations: {total_conversations}")
-    console.print(f"  Chunks: {total_chunks}")
-    console.print(f"  Errors: {errors}")
-    console.print(f"  Schema version: v{schema['version']}")
-
-    if promoted:
-        console.print(f"  Promoted: {', '.join(promoted)}")
-
-    console.print(f"\n[dim]Output: {output_dir}[/dim]")
+        console.print(f"\n[dim]Output: {output_dir}[/dim]")
 
 
 @main.command()
@@ -821,36 +917,38 @@ def query(query_text, k, output_dir):
 
     console.print(f"[green]✓ Loaded index with {store.count()} chunks[/green]\n")
 
-    # Embed the user query
-    from bud.lib.embeddings import EmbeddingClient
-    embedding_client = EmbeddingClient(config)
+    from bud.lib.kaggle_gpu import kaggle_gpu_session
+    with kaggle_gpu_session(config):
+        # Embed the user query
+        from bud.lib.embeddings import EmbeddingClient
+        embedding_client = EmbeddingClient(config)
 
-    try:
-        query_embedding = embedding_client.embed(query_text)
-    except Exception as e:
-        console.print(f"[red]Error embedding query: {e}[/red]")
-        return
+        try:
+            query_embedding = embedding_client.embed(query_text)
+        except Exception as e:
+            console.print(f"[red]Error embedding query: {e}[/red]")
+            return
 
-    # Search for top-k similar chunks
-    search_results = store.search(query_embedding, k)
+        # Search for top-k similar chunks
+        search_results = store.search(query_embedding, k)
 
-    if not search_results:
-        console.print("[yellow]No matching chunks found.[/yellow]")
-        return
+        if not search_results:
+            console.print("[yellow]No matching chunks found.[/yellow]")
+            return
 
-    # Build context from retrieved chunks
-    context_parts = []
-    for i, chunk in enumerate(search_results, 1):
-        context_parts.append(f"[{i}] {chunk.get('text', '')}")
+        # Build context from retrieved chunks
+        context_parts = []
+        for i, chunk in enumerate(search_results, 1):
+            context_parts.append(f"[{i}] {chunk.get('text', '')}")
 
-    context = "\n\n".join(context_parts)
+        context = "\n\n".join(context_parts)
 
-    # Generate answer using LLM
-    from bud.lib.llm import LLMClient
-    llm = LLMClient(config)
+        # Generate answer using LLM
+        from bud.lib.llm import LLMClient
+        llm = LLMClient(config)
 
-    # Format prompt with context and query
-    prompt = f"""You are a helpful assistant answering questions based on conversation context.
+        # Format prompt with context and query
+        prompt = f"""You are a helpful assistant answering questions based on conversation context.
 
 Context (from conversation history):
 {context}
@@ -865,11 +963,11 @@ Instructions:
 - Cite source by rank number when relevant
 """
 
-    try:
-        answer = llm.complete("You are a helpful assistant.", prompt)
-    except Exception as e:
-        console.print(f"[red]Error generating answer: {e}[/red]")
-        answer = "Unable to generate answer due to LLM error."
+        try:
+            answer = llm.complete("You are a helpful assistant.", prompt)
+        except Exception as e:
+            console.print(f"[red]Error generating answer: {e}[/red]")
+            answer = "Unable to generate answer due to LLM error."
 
     # Display results as table
     table = Table(title="Search Results")
@@ -1024,6 +1122,13 @@ def status(output_dir):
         console.print("\n[red]Configuration errors:[/red]")
         for error in errors:
             console.print(f"  - {error}")
+
+
+@main.command()
+def serve():
+    """Start the bud MCP server (stdio transport)."""
+    from bud.mcp.server import mcp
+    mcp.run()
 
 
 if __name__ == "__main__":
