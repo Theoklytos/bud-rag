@@ -1,6 +1,6 @@
 # Project State
 
-Last updated: 2026-03-19
+Last updated: 2026-03-20
 
 ## Verified Working
 
@@ -12,16 +12,42 @@ Last updated: 2026-03-19
 | discover | test_discover.py | bud/stages/discover.py | [x] |
 | embed | test_embed.py | bud/stages/embed.py, bud/lib/embeddings.py | [x] |
 | errors | test_errors.py | bud/lib/errors.py | [x] |
+| kaggle_gpu | test_kaggle_gpu.py | bud/lib/kaggle_gpu.py | [x] |
+| kaggle_notebook | test_kaggle_notebook.py | bud/kaggle/notebook_source.py, bud/kaggle/kernel_meta.py | [x] |
 | model_registry | test_model_registry.py | bud/lib/model_registry.py | [x] |
 | parse | test_parse.py | bud/stages/parse.py | [x] |
 | progress | test_progress.py | bud/lib/progress.py | [x] |
 | prompt_loader | test_prompt_loader.py | bud/lib/prompt_loader.py, bud/prompts/ | [x] |
 | schema_manager | test_schema_manager.py | bud/lib/schema_manager.py | [x] |
 | store | test_store.py | bud/lib/store.py | [x] |
+| mcp_briefing | test_mcp_briefing.py | bud/mcp/briefing.py | [x] |
+| mcp_logger | test_mcp_logger.py | bud/mcp/logger.py | [x] |
 
-All 188 tests pass (pytest 2026-03-19).
+All 229 tests pass (pytest 2026-03-20).
 
 ## Recent Sessions
+
+### 2026-03-20-1 — Kaggle GPU rewrite
+
+Rewrote the Kaggle GPU module to match the actual production architecture:
+
+**Before:** FastAPI + sentence-transformers server with random ngrok URL polling.
+Only embedding was offloaded to Kaggle; LLM always ran locally.
+`kaggle_gpu` was a separate embedding provider.
+
+**After:** Full Ollama server exposed via static ngrok domain. Both LLM and
+embedding route through remote Ollama. `kaggle_gpu_session` context manager
+wraps all AI-using CLI commands (process, discover, query) for automatic
+kernel start/stop. Shutdown via `kaggle kernels cancel`. Model persistence
+via Kaggle datasets (tar `~/.ollama/` to `/kaggle/working/`).
+
+Key changes:
+- `bud/kaggle/notebook_source.py` — Ollama + ngrok + model cache template
+- `bud/lib/kaggle_gpu.py` — Lifecycle-only manager + context manager (removed
+  embed/shutdown methods, removed KaggleEmbeddingClient, removed FallbackEmbeddingClient)
+- `bud/lib/embeddings.py` — Removed `kaggle_gpu` provider (uses standard `ollama`)
+- `bud/config.py` — New `kaggle` config section, removed `kaggle_gpu` provider
+- `bud/cli.py` — All AI commands wrapped with `kaggle_gpu_session`
 
 ### 2026-03-19-1 — Initial seed
 
@@ -41,18 +67,22 @@ Key recent work (from git log):
 
 ## Known Issues
 
-- **Uncommitted changes**: `bud/lib/embeddings.py` and `bud/stages/embed.py` have local
-  modifications not yet committed to main (visible via `git diff`). These changes may
-  include in-progress work on embedding behavior.
-- No test failures detected at seed time (188/188 pass), but the uncommitted embed changes
-  have not been reviewed — they could affect embed-stage behavior in ways not covered by
-  current tests.
+- None currently known.
 
 ## Component Interactions
 
 **Pipeline flow:**
 ```
 parse → chunk (LLM + schema_manager) → embed (embeddings + model_registry) → store (FAISS)
+```
+
+**Kaggle GPU integration:**
+```
+bud process/discover/query
+  → kaggle_gpu_session(config)
+    → KaggleGPUManager.start() [push kernel, poll health at static ngrok domain]
+    → pipeline work [all Ollama calls route through ngrok to Kaggle]
+    → KaggleGPUManager.stop() [kaggle kernels cancel]
 ```
 
 **Non-obvious couplings:**
@@ -76,6 +106,11 @@ parse → chunk (LLM + schema_manager) → embed (embeddings + model_registry) �
   `discovery_map.json`. When `bud process --with-discovery` is used, the CLI loads
   `DiscoveryMap.to_summary()` and passes it as `concept_map_summary` into
   `chunk_conversation`, injecting it into the chunking system prompt.
+
+- **kaggle_gpu_session wraps AI commands**: When `config["kaggle"]` is present with
+  `ngrok_static_domain`, the context manager auto-starts/stops the Kaggle kernel.
+  Both `llm.base_url` and `embeddings.base_url` point to the same static ngrok
+  domain, so all AI calls route through the tunnel transparently.
 
 - **blend cursor persistence**: The `BlendCursor` (bud/stages/blend.py) saves per-file
   turn offsets to `blend_cursor.json` via `IndexManager`. Progressive mode in `bud discover`
