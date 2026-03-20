@@ -625,6 +625,63 @@ def process(data_dir, output_dir, resume, batch_size, prompt, with_discovery):
         if failed_chunks:
             console.print(f"[yellow]✓ Resuming {len(failed_chunks)} failed embeddings[/yellow]")
 
+    # Initialize prompt loader
+    from bud.lib.prompt_loader import PromptLoader
+    prompts_dir = str(Path(__file__).parent / "prompts")
+    prompt_loader = PromptLoader(prompts_dir)
+    system_prompt = prompt_loader.load(prompt, {
+        "owner_name": "User",
+        "schema": json.dumps(schema["dimensions"], indent=2),
+        "file_context": f"{len(conv_files)} conversation files",
+    })
+
+    # Load discovery concept map if requested
+    concept_map_summary = None
+    if with_discovery:
+        from bud.stages.discover import DiscoveryMap
+        dm = DiscoveryMap(index_mgr.discovery_map_path).load()
+        if dm.is_empty():
+            console.print(
+                "[yellow]⚠ No discovery map found. Run 'bud discover' first, "
+                "or omit --with-discovery.[/yellow]\n"
+            )
+        else:
+            concept_map_summary = dm.to_summary()
+            console.print(
+                f"[green]✓ Loaded discovery map "
+                f"({dm.iterations_completed} iterations, "
+                f"stability={dm.stability_score:.2f})[/green]"
+            )
+
+    # Parse conversations
+    parsed_dir = output_dir / "parsed"
+    from bud.stages.parse import parse_conversations_file, parse_all
+
+    console.print("[cyan]→ Parsing conversations[/cyan]")
+    total_conversations = parse_all(data_dir, parsed_dir)
+
+    # Load parsed conversations
+    parsed_files = sorted(parsed_dir.glob("conversations_*.jsonl"))
+    all_conversations = []
+    for pf in parsed_files:
+        with open(pf) as f:
+            for line in f:
+                all_conversations.append(json.loads(line.strip()))
+
+    console.print(f"[green]✓ Parsed {total_conversations} conversations[/green]\n")
+
+    # Process in batches
+    from bud.stages.chunk import chunk_conversation
+    from bud.stages.embed import embed_chunks, clear_embed_queue
+
+    total_chunks = 0
+    errors = 0
+
+    n_convs = len(all_conversations)
+    n_batches = max(1, (n_convs + batch_size - 1) // batch_size)
+
+    console.print(f"[cyan]→ Chunking and embedding {n_convs} conversations[/cyan]")
+
     from bud.lib.kaggle_gpu import kaggle_gpu_session
     with kaggle_gpu_session(config):
         # Initialize LLM and embedding clients
@@ -632,63 +689,6 @@ def process(data_dir, output_dir, resume, batch_size, prompt, with_discovery):
         from bud.lib.embeddings import EmbeddingClient
         llm = LLMClient(config)
         embedding_client = EmbeddingClient(config)
-
-        # Initialize prompt loader
-        from bud.lib.prompt_loader import PromptLoader
-        prompts_dir = str(Path(__file__).parent / "prompts")
-        prompt_loader = PromptLoader(prompts_dir)
-        system_prompt = prompt_loader.load(prompt, {
-            "owner_name": "User",
-            "schema": json.dumps(schema["dimensions"], indent=2),
-            "file_context": f"{len(conv_files)} conversation files",
-        })
-
-        # Load discovery concept map if requested
-        concept_map_summary = None
-        if with_discovery:
-            from bud.stages.discover import DiscoveryMap
-            dm = DiscoveryMap(index_mgr.discovery_map_path).load()
-            if dm.is_empty():
-                console.print(
-                    "[yellow]⚠ No discovery map found. Run 'bud discover' first, "
-                    "or omit --with-discovery.[/yellow]\n"
-                )
-            else:
-                concept_map_summary = dm.to_summary()
-                console.print(
-                    f"[green]✓ Loaded discovery map "
-                    f"({dm.iterations_completed} iterations, "
-                    f"stability={dm.stability_score:.2f})[/green]"
-                )
-
-        # Parse conversations
-        parsed_dir = output_dir / "parsed"
-        from bud.stages.parse import parse_conversations_file, parse_all
-
-        console.print("[cyan]→ Parsing conversations[/cyan]")
-        total_conversations = parse_all(data_dir, parsed_dir)
-
-        # Load parsed conversations
-        parsed_files = sorted(parsed_dir.glob("conversations_*.jsonl"))
-        all_conversations = []
-        for pf in parsed_files:
-            with open(pf) as f:
-                for line in f:
-                    all_conversations.append(json.loads(line.strip()))
-
-        console.print(f"[green]✓ Parsed {total_conversations} conversations[/green]\n")
-
-        # Process in batches
-        from bud.stages.chunk import chunk_conversation
-        from bud.stages.embed import embed_chunks, clear_embed_queue
-
-        total_chunks = 0
-        errors = 0
-
-        n_convs = len(all_conversations)
-        n_batches = max(1, (n_convs + batch_size - 1) // batch_size)
-
-        console.print(f"[cyan]→ Chunking and embedding {n_convs} conversations[/cyan]")
 
         with Progress(
             SpinnerColumn(),
@@ -845,17 +845,17 @@ def process(data_dir, output_dir, resume, batch_size, prompt, with_discovery):
                 f"   Queue file: [dim]{index_mgr.embed_queue_path}[/dim]"
             )
 
-        # Print summary
-        console.print(f"\n[bold cyan]Pipeline Complete![/bold cyan]")
-        console.print(f"  Conversations: {total_conversations}")
-        console.print(f"  Chunks: {total_chunks}")
-        console.print(f"  Errors: {errors}")
-        console.print(f"  Schema version: v{schema['version']}")
+    # Print summary
+    console.print(f"\n[bold cyan]Pipeline Complete![/bold cyan]")
+    console.print(f"  Conversations: {total_conversations}")
+    console.print(f"  Chunks: {total_chunks}")
+    console.print(f"  Errors: {errors}")
+    console.print(f"  Schema version: v{schema['version']}")
 
-        if promoted:
-            console.print(f"  Promoted: {', '.join(promoted)}")
+    if promoted:
+        console.print(f"  Promoted: {', '.join(promoted)}")
 
-        console.print(f"\n[dim]Output: {output_dir}[/dim]")
+    console.print(f"\n[dim]Output: {output_dir}[/dim]")
 
 
 @main.command()
